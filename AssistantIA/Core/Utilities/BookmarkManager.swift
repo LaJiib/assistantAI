@@ -52,12 +52,12 @@ class BookmarkManager {
     }
     
     @MainActor
-    func requestModelFolder() -> URL?{
+    func requestDataFolder() -> URL?{
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "Select the folder containing the model"
+        panel.message = "Select the AISSD data folder"
         
         let response = panel.runModal()
         

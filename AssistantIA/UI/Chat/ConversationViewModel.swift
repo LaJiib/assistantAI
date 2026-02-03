@@ -28,6 +28,8 @@ class ConversationViewModel {
     /// Stores performance metrics from the current generation
     private var generateCompletionInfo: GenerateCompletionInfo?
     
+    private var titleGenerated: Bool = false
+    
     var errorMessage: String? = nil
     
     var messages: [Message] {
@@ -42,10 +44,16 @@ class ConversationViewModel {
     var modelDownloadProgress: Progress? {
         mlxService.modelDownloadProgress
     }
+    private let onConversationUpdated: @Sendable (Conversation, String?) -> Void
+
+    private let onDelete: @Sendable () -> Void
     
-    init(conversation: Conversation, mlxService: MLXService) {
+    init(conversation: Conversation, mlxService: MLXService, onConversationUpdated: @escaping @Sendable (Conversation, String?) -> Void, onDelete: @escaping @Sendable () -> Void) {
         self.conversation = conversation
         self.mlxService = mlxService
+        self.onConversationUpdated = onConversationUpdated
+        self.titleGenerated = conversation.messages.count > 3
+        self.onDelete = onDelete
     }
     
     /// Generates response for the current prompt and media attachments
@@ -111,9 +119,52 @@ class ConversationViewModel {
         } catch {
             errorMessage = error.localizedDescription
         }
-
+        onConversationUpdated(conversation, nil)
+        await generateTitleWithAI()
         isGenerating = false
         generateTask = nil
+    }
+    
+    private func generateTitleWithAI() async {
+        // On ne lance ça que si le modèle est chargé et qu'on est au 1er échange
+        guard mlxService.currentModel != nil else { return }
+        guard messages.count == 3 && !titleGenerated else { return }
+
+        let firstUserMessage = messages.first { $0.role == .user }?.content ?? ""
+        guard !firstUserMessage.isEmpty else { return }
+
+        // Prompt spécifique pour la génération de titre — court, direct, pas de bavardage
+        let titleMessages: [Message] = [
+            .system("Your only task is to generate a very short title (max 10 words) that summarizes the user's request and the purpose of the chat. Respond with only the title, nothing else."),
+            .user(firstUserMessage)
+        ]
+
+        do {
+            var title = ""
+            for await generation in try await mlxService.generate(messages: titleMessages) {
+                switch generation {
+                case .chunk(let chunk):
+                    title += chunk
+                case .info, .toolCall:
+                    break
+                }
+            }
+            // Nettoyer le titre (retirer les guillemets, trim, etc.)
+            let cleanedTitle = title
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            if !cleanedTitle.isEmpty {
+                onConversationUpdated(conversation, cleanedTitle)  // sauvegarder avec le nouveau titre
+                titleGenerated = true
+            }
+        } catch {
+            // En cas d'erreur, on garde "Nouvelle Conversation" — pas de crash
+            print("⚠️ Erreur génération titre: \(error)")
+        }
+    }
+    
+    func deleteConversation() {
+        onDelete()
     }
 
 
@@ -133,14 +184,6 @@ class ConversationViewModel {
         }
 
         errorMessage = nil
-    }
-    
-    func updateTitle(_ newTitle: String) {
-        conversation.title = newTitle
-    }
-    
-    private func touch() {
-        conversation.updatedAt = Date()
     }
     
     //nouvelle fonction pour éventuellement arréter les tâches lors d'un unload

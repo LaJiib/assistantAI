@@ -15,7 +15,7 @@ struct ConversationView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
-                ForEach(messages) { message in
+                ForEach(messages.filter { $0.role != .system }) { message in
                     MessageView(message)
                         .padding(.horizontal, 12)
                 }

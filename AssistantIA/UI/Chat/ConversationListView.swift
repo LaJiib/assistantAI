@@ -9,17 +9,31 @@ import SwiftUI
 
 struct ConversationListView: View {
     @Bindable var manager: ConversationManager
+    @State private var editingConversationID: UUID? = nil
     
     var body: some View{
         List(selection: $manager.activeConversationID) {
-            ForEach(manager.conversations) { conversation in
-                NavigationLink(value: conversation.id) {
+            ForEach(manager.metadata.sorted { $0.updatedAt > $1.updatedAt }) { meta in
+                NavigationLink(value: meta.id) {
                     VStack(alignment: .leading) {
-                        Text(conversation.title)
+                        Text(meta.title)
                             .font(.headline)
-                        Text("\(conversation.messages.count) messages")
+                        Text("\(meta.messageCount) messages")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                }
+                .contextMenu {
+                    Button {
+                        editingConversationID = meta.id
+                    } label: {
+                        Label("Renommer", systemImage: "pencil")
+                    }
+
+                    Button(role: .destructive) {
+                        manager.deleteConversation(id: meta.id)
+                    } label: {
+                        Label("Supprimer", systemImage: "trash")
                     }
                 }
             }
@@ -34,10 +48,11 @@ struct ConversationListView: View {
             }
         }
     }
+    
     func deleteConversations(at offsets: IndexSet) {
+        let sorted = manager.metadata.sorted { $0.updatedAt > $1.updatedAt }
         for index in offsets {
-            let conversation = manager.conversations[index]
-            manager.deleteConversation(id: conversation.id)
+            manager.deleteConversation(id: sorted[index].id)
         }
     }
 }

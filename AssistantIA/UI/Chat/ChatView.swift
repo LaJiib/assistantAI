@@ -46,7 +46,12 @@ struct ChatView: View {
 
 #Preview {
     let service = MLXService()
-    let conversation = Conversation(systemPrompt: "Preview conversation")
-    let viewModel = ConversationViewModel(conversation: conversation, mlxService: service)
-    return ChatView(viewModel: viewModel)
+    let conversation = Conversation(id: UUID(), systemPrompt: "Preview conversation")
+    let viewModel = ConversationViewModel(
+        conversation: conversation,
+        mlxService: service,
+        onConversationUpdated: { _, _ in },
+        onDelete: { }
+    )
+    ChatView(viewModel: viewModel)
 }

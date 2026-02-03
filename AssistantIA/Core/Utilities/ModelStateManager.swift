@@ -74,16 +74,18 @@ class ModelStateManager {
         self.conversationManager = conversationManager
         if let url = try? bookmarkManager.loadBookmark() {
             modelState = .configured(url)
+            conversationManager.setDataFolderURL(url)
         }
     }
     
     @MainActor
     func requestModelFolder() -> URL? {
-        guard let url = bookmarkManager.requestModelFolder() else {
+        guard let url = bookmarkManager.requestDataFolder() else {
             return nil
         }
         try? bookmarkManager.saveBookmark(for: url)
         modelState = .configured(url)
+        conversationManager.setDataFolderURL(url)
         return url
     }
     
@@ -93,9 +95,12 @@ class ModelStateManager {
         }
         modelState = .loading
         do {
-            try await mlxService.loadLocalModel(at: url.path)
+            let modelPath = url.appendingPathComponent("models/mistral-nemo-instruct")
+            try await mlxService.loadLocalModel(at: modelPath.path)
             modelState = .loaded(url)
         } catch {
+            // Invalider le bookmark qui a conduit à cette erreur
+            UserDefaults.standard.removeObject(forKey: "modelFolderBookmark")
             modelState = .error(error.localizedDescription)
             throw error
         }

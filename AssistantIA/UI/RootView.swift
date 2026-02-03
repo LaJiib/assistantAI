@@ -18,10 +18,10 @@ struct RootView: View {
     
     var body: some View {
         switch modelStateManager.modelState {
-        case .notConfigured:
+        case .notConfigured, .error:
             SetupView(modelStateManager: modelStateManager)
             
-        case .configured, .loading, .loaded, .error:
+        case .configured, .loading, .loaded:
             mainView
         }
     }
@@ -42,6 +42,7 @@ struct RootView: View {
             // Navigation principale
             NavigationSplitView {
                 ConversationListView(manager: conversationManager)
+                    .navigationSplitViewColumnWidth(min: 250, ideal: 300)
             } detail: {
                 if let viewModel = conversationManager.activeViewModel {
                     ChatView(viewModel: viewModel)

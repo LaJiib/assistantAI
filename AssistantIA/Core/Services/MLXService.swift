@@ -8,72 +8,60 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+internal import Tokenizers
 
-/// Service gérant le modèle MLX pour la génération de texte
-actor MLXService {
+
+/// A service class that manages machine learning models for text and vision-language tasks.
+/// This class handles model loading, caching, and text generation using various LLM and VLM models.
+@Observable
+class MLXService {
+
+    /// Cache to store loaded model containers to avoid reloading.
+    private var loadedContainer: ModelContainer? = nil
+
+    /// Tracks the current model download progress.
+    /// Access this property to monitor model download status.
+    @MainActor
+    private(set) var modelDownloadProgress: Progress?
     
-    // MARK: - Properties
+    private(set) var currentModel: LMModel?
     
-    /// Cache pour éviter de recharger le modèle
-    private let modelCache = NSCache<NSString, ModelContainer>()
-    
-    /// Configuration du modèle
-    private let modelConfiguration: ModelConfiguration
-    
-    /// Clé de cache pour notre modèle unique
-    private let cacheKey = "mistral-nemo-local" as NSString
-    
-    /// Statut du chargement
-    private(set) var isLoaded = false
-    
-    // MARK: - Initialization
-    
-    init() {
-        // Créer la configuration depuis le directory local
-        let modelURL = URL(fileURLWithPath: Constants.modelPath)
-        
-        self.modelConfiguration = ModelConfiguration(
-            directory: modelURL,
-            tokenizerId: nil,
-            overrideTokenizer: nil,
-            defaultPrompt: Constants.defaultSystemPrompt,
-            extraEOSTokens: []
-        )
-    }
-    
-    // MARK: - Model Loading
-    
-    /// Charge le modèle (ou le récupère du cache)
-    private func loadModel() async throws -> ModelContainer {
-        // Limiter la mémoire GPU pour éviter les crashes
-        // Note: Limitation de mémoire GPU non disponible via `Memory.cacheLimit` ici.
-        // Si nécessaire, configurez les paramètres du modèle/contexte fournis par MLX ou ajustez les tailles de tensors.
-        
-        // Vérifier le cache
-        if let container = modelCache.object(forKey: cacheKey) {
-            print("📦 Modèle récupéré du cache")
+    init() {}
+
+    /// Loads the current model container, or returns the already loaded one.
+    /// - Returns: The active ModelContainer
+    /// - Throws: Errors that might occur during model loading
+    private func loadContainer() async throws -> ModelContainer {
+        if let container = loadedContainer {
             return container
         }
-        
-        print("📦 Chargement du modèle depuis : \(Constants.modelPath)")
-        
-        // Charger le modèle via LLMModelFactory
-        let container = try await LLMModelFactory.shared.loadContainer(
-            hub: defaultHubApi,
-            configuration: modelConfiguration
-        ) { progress in
-            let percentage = Int(progress.fractionCompleted * 100)
-            print("⏳ Chargement : \(percentage)%")
+        guard let model = currentModel else {
+            throw MLXServiceError.modelNotLoaded
         }
-        
-        // Mettre en cache
-        modelCache.setObject(container, forKey: cacheKey)
-        isLoaded = true
-        
-        print("✅ Modèle chargé et prêt")
+        let container = try await LLMModelFactory.shared.loadContainer(
+            hub: defaultHubApi, configuration: model.configuration
+        ) { progress in
+            Task { @MainActor in
+                self.modelDownloadProgress = progress
+            }
+        }
+        loadedContainer = container
         return container
     }
+
     
+    func loadLocalModel(at path: String) async throws {
+        let configuration = ModelConfiguration(directory: URL(filePath: path))
+        currentModel = LMModel(name: "Nemo-12b-instruct", configuration: configuration)
+        try await _ = loadContainer()
+    }
+    
+    func unloadModel() {
+        loadedContainer = nil
+        currentModel = nil
+        MLX.GPU.clearCache()
+    }
+
     /// Generates text based on the provided messages using the specified model.
     /// - Parameters:
     ///   - messages: Array of chat messages including user, assistant, and system messages
@@ -82,10 +70,14 @@ actor MLXService {
     /// - Throws: Errors that might occur during generation
     func generate(messages: [Message]) async throws -> AsyncStream<Generation> {
         // Load or retrieve model from cache
-        let modelContainer = try await loadModel()
+        guard currentModel != nil else {
+                    throw MLXServiceError.modelNotLoaded
+                }
+
+        let modelContainer = try await loadContainer()
 
         // Map app-specific Message type to Chat.Message for model input
-        let chatMessages = messages.map { message in
+        let chat = messages.map { message in
             let role: Chat.Message.Role =
                 switch message.role {
                 case .assistant:
@@ -102,13 +94,27 @@ actor MLXService {
 
         // Prepare input for model processing
         let userInput = UserInput(
-            chat: chatMessages, processing: .init())
-
-        // Generate response using the model
+            chat: chat)
+        // DEBUG 1 : Avant prepare
+        print("📥 UserInput AVANT prepare:")
+        print("   Prompt: \(userInput.prompt)")
+        print("   Chat: \(chat)")
+        
         return try await modelContainer.perform { (context: ModelContext) in
             let lmInput = try await context.processor.prepare(input: userInput)
+            
+            // DEBUG 2 : Après prepare
+            print("📤 LMInput APRÈS prepare:")
+            print("   Type: \(type(of: lmInput))")
+            // Si tu peux accéder aux tokens :
+            print("   Tokens: \(lmInput.text.tokens)")
+            
+            // DÉCODE les tokens pour voir le texte
+            let tokenIds = lmInput.text.tokens.asArray(Int.self)
+            let decodedText = context.tokenizer.decode(tokens: tokenIds)
+            print("   📝 Texte décodé: \(decodedText)")
             let parameters = await GenerateParameters(maxTokens: Constants.defaultMaxTokens,
-                temperature: Constants.defaultTemperature,)
+                temperature: Constants.defaultTemperature)
 
             return try MLXLMCommon.generate(
                 input: lmInput, parameters: parameters, context: context)
@@ -116,3 +122,16 @@ actor MLXService {
     }
 }
 
+enum MLXServiceError: LocalizedError {
+    case modelNotLoaded
+    case modelLoadFailed(String)
+    
+    var errorDescription: String? {
+        switch self {
+        case .modelNotLoaded:
+            return "Aucun modèle n'est chargé. Veuillez charger un modèle d'abord."
+        case .modelLoadFailed(let reason):
+            return "Échec du chargement du modèle: \(reason)"
+        }
+    }
+}

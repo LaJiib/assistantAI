@@ -5,103 +5,48 @@
 //  Created by JB SENET on 31/01/2026.
 //
 
+import AVFoundation
+import AVKit
 import SwiftUI
 
+/// Main chat interface view that manages the conversation UI and user interactions.
+/// Displays messages, handles media attachments, and provides input controls.
 struct ChatView: View {
-    @State private var viewModel: ChatViewModel
-    
-    init() {
-        let mlxService = MLXService()
-        _viewModel = State(initialValue: ChatViewModel(mlxService: mlxService))
+    /// View model that manages the chat state and business logic
+    @Bindable private var vm: ConversationViewModel
+
+    /// Initializes the chat view with a view model
+    /// - Parameter viewModel: The view model to manage chat state
+    init(viewModel: ConversationViewModel) {
+        self.vm = viewModel
     }
-    
+
     var body: some View {
-        VStack(spacing: 0) {
-            // Status bar
-            statusBar
-            
-            // Liste des messages
-            messageList
-            
-            // Barre d'input
-            InputBar(
-                text: $viewModel.prompt,
-                isGenerating: viewModel.isGenerating,
-                isEnabled: true,
-                onSend: {
-                    Task {
-                        await viewModel.generate()
-                    }
-                }
-            )
-        }
-    }
-    
-    private var statusBar: some View {
-        HStack {
-            if viewModel.isGenerating {
-                ProgressView()
-                    .scaleEffect(0.8)
-                Text("Génération en cours...")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            } else {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 8, height: 8)
-                Text("Prêt")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            
-            if let error = viewModel.errorMessage {
-                Spacer()
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 8, height: 8)
-                Text("Erreur: \(error)")
-                    .font(.caption)
-                    .foregroundColor(.red)
-                    .lineLimit(1)
-            }
-            
-            Spacer()
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(Color.gray.opacity(0.1))
-    }
-    
-    private var messageList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    ForEach(viewModel.messages) { message in
-                        MessageBubble(message: message)
-                            .id(message.id)
-                    }
-                    
-                    if viewModel.isGenerating && viewModel.messages.isEmpty {
-                        HStack {
-                            ProgressView()
-                            Text("Réflexion en cours...")
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
+        NavigationStack {
+            VStack(spacing: 0) {
+                // Display conversation history
+                ConversationView(messages: vm.messages)
+
+                Divider()
+
+                // Input field with send and media attachment buttons
+                PromptField(
+                    prompt: $vm.prompt,
+                    sendButtonAction: vm.generate,
+                )
                 .padding()
             }
-            .onChange(of: viewModel.messages.count) { _ in
-                if let lastMessage = viewModel.messages.last {
-                    withAnimation {
-                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
-                    }
-                }
+            .navigationTitle("MLX Chat Example")
+            .toolbar {
+                ChatToolbarView(vm: vm)
             }
         }
     }
 }
 
 #Preview {
-    ChatView()
+    let service = MLXService()
+    let conversation = Conversation(systemPrompt: "Preview conversation")
+    let viewModel = ConversationViewModel(conversation: conversation, mlxService: service)
+    return ChatView(viewModel: viewModel)
 }

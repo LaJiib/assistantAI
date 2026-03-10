@@ -11,6 +11,8 @@ struct Message: Identifiable, Equatable, Codable {
     let id: UUID
     let role: Role
     var content: String
+    /// Array of image URLs attached to the message
+    var images: [URL]
     let timestamp: Date
     
     enum Role: Codable {
@@ -19,10 +21,11 @@ struct Message: Identifiable, Equatable, Codable {
         case system
     }
     
-    init(role: Role, content: String) {
+    init(role: Role, content: String, images: [URL] = []) {
         self.id = UUID()
         self.role = role
         self.content = content
+        self.images = images
         self.timestamp = Date()
     }
 }
@@ -32,8 +35,8 @@ extension Message {
     /// - Parameters:
     ///   - content: The text content of the message
     /// - Returns: A new Message instance with user role
-    static func user(_ content: String) -> Message {
-        Message(role: .user, content: content)
+    static func user(_ content: String, images: [URL] = []) -> Message {
+        Message(role: .user, content: content, images: images)
     }
 
     /// Creates an assistant message

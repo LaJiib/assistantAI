@@ -26,6 +26,7 @@ class MLXService {
     
     private(set) var currentModel: LMModel?
     
+    
     init() {}
 
     /// Loads the current model container, or returns the already loaded one.
@@ -52,14 +53,18 @@ class MLXService {
     
     func loadLocalModel(at path: String) async throws {
         let configuration = ModelConfiguration(directory: URL(filePath: path))
-        currentModel = LMModel(name: "Nemo-12b-instruct", configuration: configuration)
-        try await _ = loadContainer()
+        currentModel = LMModel(name: "Ministral3-14B-instruct", configuration: configuration)
+        let container = try await loadContainer()
+        print("🔍 === DIAGNOSTIC PROCESSOR ===")
+        print("🔍 Type du processor: \(type(of: container.processor))")
+        print("🔍 Nom du type: \(String(describing: type(of: container.processor)))")
     }
+
     
     func unloadModel() {
         loadedContainer = nil
         currentModel = nil
-        MLX.GPU.clearCache()
+        Memory.clearCache()
     }
 
     /// Generates text based on the provided messages using the specified model.
@@ -87,14 +92,15 @@ class MLXService {
                 case .system:
                     .system
                 }
-
+        let images: [UserInput.Image] = message.images.map { imageURL in .url(imageURL) }
+            
             return Chat.Message(
-                role: role, content: message.content)
+                role: role, content: message.content, images: images)
         }
 
         // Prepare input for model processing
         let userInput = UserInput(
-            chat: chat)
+            chat: chat, processing: .init(resize: .init(width: 1540, height: 1540)))
         // DEBUG 1 : Avant prepare
         print("📥 UserInput AVANT prepare:")
         print("   Prompt: \(userInput.prompt)")

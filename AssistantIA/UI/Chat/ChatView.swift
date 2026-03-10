@@ -30,9 +30,12 @@ struct ChatView: View {
                 Divider()
 
                 // Input field with send and media attachment buttons
+                MediaPreviewsView(mediaSelection: vm.mediaSelection)
                 PromptField(
                     prompt: $vm.prompt,
                     sendButtonAction: vm.generate,
+                    // Only show media button for vision-capable models
+                    mediaButtonAction: {vm.mediaSelection.isShowing = true}
                 )
                 .padding()
             }
@@ -40,6 +43,11 @@ struct ChatView: View {
             .toolbar {
                 ChatToolbarView(vm: vm)
             }
+            .fileImporter(
+                isPresented: $vm.mediaSelection.isShowing,
+                allowedContentTypes: [.image],
+                onCompletion: vm.addMedia
+            )
         }
     }
 }

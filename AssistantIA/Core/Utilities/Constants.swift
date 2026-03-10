@@ -10,7 +10,6 @@ import Foundation
 enum Constants {
     // Path vers le modèle sur votre SSD externe
     // À MODIFIER selon votre configuration
-    static let modelPath = "/Volumes/AISSD/Models/mistral-nemo-instruct"
     
     // System prompt par défaut
     static let defaultSystemPrompt = "Tu t'appelles Iris, Tu es mon assistante personnelle IA serviable et précise."

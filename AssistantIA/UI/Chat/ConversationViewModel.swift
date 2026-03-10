@@ -19,6 +19,9 @@ class ConversationViewModel {
     /// Current user input text
     var prompt: String = ""
     
+    /// Manages image and video attachments for the current message
+    var mediaSelection = MediaSelection()
+    
     // Indicates if text generation is in progress
     var isGenerating = false
     
@@ -67,7 +70,7 @@ class ConversationViewModel {
         isGenerating = true
 
         // Add user message with any media attachments
-        messages.append(.user(prompt))
+        messages.append(.user(prompt, images: mediaSelection.images))
 
         // Clear the input after sending
         clear(.prompt)
@@ -163,6 +166,22 @@ class ConversationViewModel {
         }
     }
     
+    /// Processes and adds media attachments to the current message
+    func addMedia(_ result: Result<URL, any Error>) {
+        do {
+            let url = try result.get()
+
+            // Determine media type and add to appropriate collection
+            if let mediaType = UTType(filenameExtension: url.pathExtension) {
+                if mediaType.conforms(to: .image) {
+                    mediaSelection.images = [url]
+                }
+            }
+        } catch {
+            errorMessage = "Failed to load media item.\n\nError: \(error)"
+        }
+    }
+    
     func deleteConversation() {
         onDelete()
     }
@@ -172,6 +191,7 @@ class ConversationViewModel {
     func clear(_ options: ClearOption) {
         if options.contains(.prompt) {
             prompt = ""
+            mediaSelection = .init()
         }
 
         if options.contains(.chat) {
@@ -192,4 +212,36 @@ class ConversationViewModel {
         generateTask = nil
     }
 
+}
+
+/// Manages the state of media attachments in the chat
+@Observable
+class MediaSelection {
+    /// Controls visibility of media selection UI
+    var isShowing = false
+
+    /// Currently selected image URLs
+    var images: [URL] = [] {
+        didSet {
+            didSetURLs(oldValue, images)
+        }
+    }
+
+    /// Currently selected video URLs
+    var videos: [URL] = [] {
+        didSet {
+            didSetURLs(oldValue, videos)
+        }
+    }
+
+    /// Whether any media is currently selected
+    var isEmpty: Bool {
+        images.isEmpty && videos.isEmpty
+    }
+
+    private func didSetURLs(_ old: [URL], _ new: [URL]) {
+        // the urls we get from fileImporter require SSB calls to access
+        new.filter { !old.contains($0) }.forEach { _ = $0.startAccessingSecurityScopedResource() }
+        old.filter { !new.contains($0) }.forEach { $0.stopAccessingSecurityScopedResource() }
+    }
 }

@@ -108,6 +108,20 @@ struct MessageView: View {
             HStack {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 8) {
+                    
+                    // Display first image if present
+                    if let firstImage = message.images.first {
+                        AsyncImage(url: firstImage) { image in
+                            image
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                        } placeholder: {
+                            ProgressView()
+                        }
+                        .frame(maxWidth: 250, maxHeight: 200)
+                        .clipShape(.rect(cornerRadius: 12))
+                    }
+                    
                     // Message content with tinted background.
                     // LocalizedStringKey used to trigger default handling of markdown content.
                     Text(LocalizedStringKey(message.content))

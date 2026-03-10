@@ -12,9 +12,16 @@ struct PromptField: View {
     @State private var task: Task<Void, Never>?
 
     let sendButtonAction: () async -> Void
+    let mediaButtonAction: (() -> Void)?
 
     var body: some View {
         HStack {
+            if let mediaButtonAction {
+                Button(action: mediaButtonAction) {
+                    Image(systemName: "photo.badge.plus")
+                }
+            }
+
             TextField("Prompt", text: $prompt)
                 .textFieldStyle(.roundedBorder)
 
@@ -46,5 +53,6 @@ struct PromptField: View {
 
 #Preview {
     PromptField(prompt: .constant("")) {
+    } mediaButtonAction: {
     }
 }

@@ -10,7 +10,9 @@ import SwiftUI
 struct RootView: View {
     @Bindable var modelStateManager: ModelStateManager
     @Bindable var conversationManager: ConversationManager
-    
+    @Environment(BackendManager.self) private var backendManager
+    @State private var showBackendSettings = false
+
     init(modelStateManager: ModelStateManager, conversationManager: ConversationManager) {
         self.modelStateManager = modelStateManager
         self.conversationManager = conversationManager
@@ -55,6 +57,19 @@ struct RootView: View {
             }
             .toolbar {
                 modelControlToolbar
+                backendStatusToolbar
+            }
+            .sheet(isPresented: $showBackendSettings) {
+                NavigationStack {
+                    BackendSettingsView()
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Fermer") { showBackendSettings = false }
+                            }
+                        }
+                }
+                .environment(backendManager)
+                .frame(minWidth: 400, minHeight: 460)
             }
         }
     }
@@ -63,6 +78,42 @@ struct RootView: View {
     private var modelControlToolbar: some ToolbarContent {
         ToolbarItem(placement: .primaryAction) {
             modelControlButton
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var backendStatusToolbar: some ToolbarContent {
+        ToolbarItem(placement: .status) {
+            Button {
+                showBackendSettings = true
+            } label: {
+                backendStatusLabel
+            }
+            .buttonStyle(.borderless)
+            .help("État backend Python — cliquez pour les détails")
+        }
+    }
+
+    @ViewBuilder
+    private var backendStatusLabel: some View {
+        switch backendManager.state {
+        case .stopped:
+            Label("Backend arrêté", systemImage: "circle")
+                .foregroundStyle(.secondary)
+                .labelStyle(.iconOnly)
+        case .starting:
+            Label("Backend en démarrage", systemImage: "circle.dotted")
+                .foregroundStyle(.orange)
+                .labelStyle(.iconOnly)
+                .symbolEffect(.pulse)
+        case .running:
+            Label("Backend actif", systemImage: "circle.fill")
+                .foregroundStyle(.green)
+                .labelStyle(.iconOnly)
+        case .error:
+            Label("Erreur backend", systemImage: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
+                .labelStyle(.iconOnly)
         }
     }
     

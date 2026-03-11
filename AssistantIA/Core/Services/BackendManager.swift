@@ -38,6 +38,12 @@ final class BackendManager {
 
     private(set) var state: State = .stopped
 
+    /// PID du process Python actif, nil si arrêté. Pour debug / Activity Monitor.
+    var pid: Int? {
+        guard let p = process, p.isRunning else { return nil }
+        return Int(p.processIdentifier)
+    }
+
     // MARK: - Config
 
     private let backendPath: String
@@ -61,14 +67,23 @@ final class BackendManager {
     init() {
         let repoRoot = Self.findRepoRoot()
         backendPath = "\(repoRoot)/backend"
-        pythonPath  = "\(repoRoot)/backend/venv/bin/python"
+        // Résoudre le double symlink python → python3.14 → /opt/homebrew/...
+        // Process.run() échoue si l'exécutable est un symlink vers un chemin hors sandbox.
+        let symlinkPath = "\(repoRoot)/backend/venv/bin/python"
+        pythonPath = URL(fileURLWithPath: symlinkPath)
+            .resolvingSymlinksInPath().path
     }
 
     /// Remonte l'arborescence pour trouver la racine du repo (contient backend/main.py).
+    ///
+    /// NSHomeDirectory() retourne le répertoire sandbox dans une app macOS sandboxée
+    /// (/Users/xxx/Library/Containers/…). On utilise NSUserName() pour construire
+    /// le vrai répertoire home de l'utilisateur (/Users/xxx).
     private static func findRepoRoot() -> String {
+        let realHome = "/Users/\(NSUserName())"
         let candidates = [
-            "\(NSHomeDirectory())/AssistantIA/AssistantIA",
-            "\(NSHomeDirectory())/Developer/AssistantIA",
+            "\(realHome)/AssistantIA/AssistantIA",
+            "\(realHome)/Developer/AssistantIA",
         ]
         let fm = FileManager.default
         for candidate in candidates {
@@ -77,7 +92,7 @@ final class BackendManager {
             }
         }
         // Fallback : chemin connu du projet
-        return "\(NSHomeDirectory())/AssistantIA/AssistantIA"
+        return "\(realHome)/AssistantIA/AssistantIA"
     }
 
     // MARK: - Public API
@@ -154,8 +169,34 @@ final class BackendManager {
         p.arguments = ["main.py"]
         p.currentDirectoryURL = URL(fileURLWithPath: backendPath)
 
-        // Hériter de l'environnement système + forcer HOST/PORT localhost
+        // Construire l'environnement venv manuellement.
+        //
+        // Problème : pythonPath est résolu via resolvingSymlinksInPath() pour que
+        // Process.run() trouve le binaire Homebrew. Mais Python résolu depuis
+        // /opt/homebrew/... ne détecte pas le pyvenv.cfg → venv non activé → ImportError.
+        //
+        // Solution : recréer ce que `source venv/bin/activate` fait, en posant
+        // VIRTUAL_ENV, PYTHONPATH et PATH directement dans l'environnement du process.
+        let venvPath = "\(backendPath)/venv"
         var env = ProcessInfo.processInfo.environment
+
+        // VIRTUAL_ENV : signale à Python qu'il tourne dans ce venv
+        env["VIRTUAL_ENV"] = venvPath
+
+        // PYTHONPATH : chemin vers les packages installés dans le venv
+        // Recherche dynamique du dossier python3.x pour ne pas hardcoder la version
+        let libPath = "\(venvPath)/lib"
+        if let dirs = try? FileManager.default.contentsOfDirectory(atPath: libPath),
+           let pyDir = dirs.first(where: { $0.hasPrefix("python") }) {
+            env["PYTHONPATH"] = "\(libPath)/\(pyDir)/site-packages"
+        }
+
+        // PATH : ajouter venv/bin en tête pour que les scripts du venv (uvicorn, etc.)
+        // soient trouvés en priorité par les sous-processus Python
+        let currentPath = env["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        env["PATH"] = "\(venvPath)/bin:\(currentPath)"
+
+        // Paramètres backend
         env["HOST"] = host
         env["PORT"] = String(port)
         p.environment = env
@@ -209,10 +250,12 @@ final class BackendManager {
 
     private func waitForBackendReady(timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
-        let pollInterval: UInt64 = 500_000_000  // 500ms en nanosecondes
+        let pollInterval: UInt64 = 2_000_000_000  // 2s — réduit le bruit de logs réseau
 
         while Date() < deadline {
-            // Vérifier si le process a crashé entre deux polls
+            // Arrêt explicite demandé (stop() appelé pendant le démarrage)
+            if case .stopped = state { return }
+            // Process crashé entre deux polls
             if case .error = state {
                 throw BackendError.startupFailed(stderrBuffer)
             }

@@ -188,6 +188,56 @@ Tokens stream back
 - Reasoning step-by-step
 - Sweet spot perf/qualité (14B)
 
+## Intégration Frontend Swift
+
+### Phase 2 : Migration complète backend
+
+Le frontend Swift (AssistantIA.xcodeproj) a migré toute l'inférence vers ce backend Python. Swift gère uniquement l'UI et la persistance des conversations.
+
+**Architecture Phase 2** :
+```
+┌─────────────────────────────────┐
+│  App Swift (UI pure)            │
+│  - SwiftUI views                │
+│  - ConversationManager          │
+│  - Gère lifecycle backend       │
+└──────────┬──────────────────────┘
+           │ HTTP localhost
+           │ (streaming SSE)
+           ▼
+┌─────────────────────────────────┐
+│  Backend Python (ce serveur)    │
+│  - MLX + Ministral 14B          │
+│  - Endpoints /chat, /chat/stream│
+│  - (Phase 3+) RAG, tools        │
+└─────────────────────────────────┘
+```
+
+**Démarrage automatique** :
+- App Swift lance ce backend au démarrage (subprocess)
+- Backend démarre en < 30s
+- Arrêt app → arrêt backend propre
+
+**Communication** :
+- POST /chat : génération complète
+- POST /chat/stream : streaming SSE (tokens temps réel)
+- Format : `data: {"text": "chunk"}\n\n` ... `data: [DONE]\n\n`
+
+**Code Swift** :
+```swift
+// BackendManager démarre backend
+let manager = BackendManager()
+try await manager.start()
+
+// ChatAPI consomme streaming
+let api = ChatAPI()
+for await chunk in api.streamMessage("Bonjour") {
+    print(chunk)  // Tokens progressifs
+}
+```
+
+Voir `AssistantIA/Core/{BackendManager,ChatAPI}.swift` pour implémentation.
+
 ## Sécurité
 
 ### Contraintes respectées

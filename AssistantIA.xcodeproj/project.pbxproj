@@ -10,6 +10,7 @@
 		2E26AC782F2E250A00D1F408 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 2E26AC772F2E250A00D1F408 /* MLXLLM */; };
 		2E26AC7A2F2E250A00D1F408 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 2E26AC792F2E250A00D1F408 /* MLXLMCommon */; };
 		2E26AC7D2F2E252000D1F408 /* SQLite in Frameworks */ = {isa = PBXBuildFile; productRef = 2E26AC7C2F2E252000D1F408 /* SQLite */; };
+		2EF6C3142F617BD90009CC77 /* AGENTS.md in Resources */ = {isa = PBXBuildFile; fileRef = 2EF6C3132F617BD20009CC77 /* AGENTS.md */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -33,6 +34,13 @@
 		2E26AC4C2F2E24B600D1F408 /* AssistantIA.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AssistantIA.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		2E26AC592F2E24B700D1F408 /* AssistantIATests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AssistantIATests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2E26AC632F2E24B700D1F408 /* AssistantIAUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AssistantIAUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		2EF6C3132F617BD20009CC77 /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = AGENTS.md; sourceTree = "<group>"; };
+		2EF6C3192F617C470009CC77 /* main.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = main.py; sourceTree = "<group>"; };
+		2EF6C31A2F617C570009CC77 /* requirements.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = requirements.txt; sourceTree = "<group>"; };
+		2EF6C31B2F617C6D0009CC77 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		2EF6C31C2F61810B0009CC77 /* __init__.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = __init__.py; sourceTree = "<group>"; };
+		2EF6C31D2F6181280009CC77 /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = .gitignore; sourceTree = "<group>"; };
+		2EF6C31E2F61819B0009CC77 /* .env.example */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = .env.example; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -84,6 +92,8 @@
 		2E26AC432F2E24B600D1F408 = {
 			isa = PBXGroup;
 			children = (
+				2EF6C3152F617C140009CC77 /* backend */,
+				2EF6C3132F617BD20009CC77 /* AGENTS.md */,
 				2E26AC4E2F2E24B600D1F408 /* AssistantIA */,
 				2E26AC5C2F2E24B700D1F408 /* AssistantIATests */,
 				2E26AC662F2E24B700D1F408 /* AssistantIAUITests */,
@@ -99,6 +109,35 @@
 				2E26AC632F2E24B700D1F408 /* AssistantIAUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		2EF6C3152F617C140009CC77 /* backend */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6C31E2F61819B0009CC77 /* .env.example */,
+				2EF6C31D2F6181280009CC77 /* .gitignore */,
+				2EF6C31B2F617C6D0009CC77 /* README.md */,
+				2EF6C31A2F617C570009CC77 /* requirements.txt */,
+				2EF6C3192F617C470009CC77 /* main.py */,
+				2EF6C3182F617C360009CC77 /* tests */,
+				2EF6C3162F617C210009CC77 /* core */,
+			);
+			path = backend;
+			sourceTree = "<group>";
+		};
+		2EF6C3162F617C210009CC77 /* core */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6C31C2F61810B0009CC77 /* __init__.py */,
+			);
+			path = core;
+			sourceTree = "<group>";
+		};
+		2EF6C3182F617C360009CC77 /* tests */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = tests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -228,6 +267,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				2EF6C3142F617BD90009CC77 /* AGENTS.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

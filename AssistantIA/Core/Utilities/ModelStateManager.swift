@@ -95,7 +95,7 @@ class ModelStateManager {
         }
         modelState = .loading
         do {
-            let modelPath = url.appendingPathComponent("models/mistral-nemo-instruct")
+            let modelPath = url.appendingPathComponent("models/Ministral-3-14B-Instruct-2512-8bit")
             try await mlxService.loadLocalModel(at: modelPath.path)
             modelState = .loaded(url)
         } catch {

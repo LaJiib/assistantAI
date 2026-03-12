@@ -1,0 +1,329 @@
+"""
+Router FastAPI — CRUD conversations.
+
+Prefix : /api/conversations
+
+Endpoints :
+  GET    /              → liste ConversationMetadata (triée updatedAt desc)
+  POST   /              → créer conversation → 201 ConversationMetadata
+  GET    /{id}          → détail Conversation (metadata + messages) → 200
+  PUT    /{id}          → modifier titre → 200 ConversationMetadata
+  DELETE /{id}          → supprimer → 204
+
+Codes HTTP :
+  201  Created         — POST réussi
+  204  No Content      — DELETE réussi
+  400  Bad Request     — titre vide ou trop long (via Pydantic + HTTPException)
+  404  Not Found       — ID inexistant ou fichier {uuid}.json absent
+  422  Unprocessable   — validation Pydantic automatique (FastAPI)
+  500  Internal Error  — erreur I/O inattendue
+
+Règles métier :
+  - createdAt immutable après création
+  - updatedAt mis à jour à chaque PUT
+  - systemPrompt immutable (intégré dans messages[0])
+  - Conversation créée avec message system initial (compatibilité Swift)
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import timezone
+from typing import List
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
+
+from models.conversation import (
+    Conversation,
+    ConversationMetadata,
+    Message,
+    Role,
+    _utcnow,
+)
+from storage.json_manager import JSONManager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+
+# ── Dependency ────────────────────────────────────────────────────────────────
+
+def get_json_manager(request: Request) -> JSONManager:
+    """Injecte le JSONManager depuis app.state (initialisé dans main.py)."""
+    return request.app.state.json_manager
+
+
+# ── Schemas request ───────────────────────────────────────────────────────────
+
+class CreateConversationRequest(BaseModel):
+    title:        str = Field(..., min_length=1, max_length=500,
+                               description="Titre de la conversation")
+    systemPrompt: str = Field(..., min_length=1, max_length=4000,
+                               description="Prompt système définissant le comportement")
+
+
+class UpdateConversationRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500,
+                        description="Nouveau titre de la conversation")
+
+
+# ── Schemas response ──────────────────────────────────────────────────────────
+
+class MessageResponse(BaseModel):
+    id:        str
+    role:      str
+    content:   str
+    timestamp: str
+
+    @classmethod
+    def from_model(cls, msg: Message) -> "MessageResponse":
+        ts = msg.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return cls(
+            id=str(msg.id),
+            role=msg.role.value,
+            content=msg.content,
+            timestamp=ts.isoformat(),
+        )
+
+
+class ConversationResponse(BaseModel):
+    """Métadonnées seules — utilisé pour list et create."""
+    id:           str
+    title:        str
+    systemPrompt: str
+    createdAt:    str
+    updatedAt:    str
+    messageCount: int
+
+    @classmethod
+    def from_metadata(cls, meta: ConversationMetadata) -> "ConversationResponse":
+        # Utilise model_dump(mode="json") qui applique les field_serializer datetime
+        d = meta.model_dump(mode="json")
+        return cls(**d)
+
+
+class ConversationDetailResponse(BaseModel):
+    """Métadonnées + messages — utilisé pour GET /{id}."""
+    id:           str
+    title:        str
+    systemPrompt: str
+    createdAt:    str
+    updatedAt:    str
+    messageCount: int
+    messages:     List[MessageResponse]
+
+    @classmethod
+    def from_metadata_and_conversation(
+        cls,
+        meta: ConversationMetadata,
+        conv: Conversation,
+    ) -> "ConversationDetailResponse":
+        d = meta.model_dump(mode="json")
+        return cls(
+            **d,
+            messages=[MessageResponse.from_model(m) for m in conv.messages],
+        )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_meta_or_404(
+    conversation_id: str,
+    jm: JSONManager,
+) -> ConversationMetadata:
+    """
+    Retourne la métadonnée ou lève 404.
+
+    load_index() a déjà effectué l'auto-cleanup — si l'ID n'est pas dans
+    l'index, c'est qu'il n'existe pas (ou que le fichier était manquant).
+    """
+    index = jm.load_index()
+    for meta in index:
+        if meta.id.lower() == conversation_id.lower():
+            return meta
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Conversation {conversation_id} introuvable")
+
+
+def _load_conversation_or_404(
+    conversation_id: str,
+    jm: JSONManager,
+) -> Conversation:
+    """Charge {uuid}.json ou lève 404 si absent/invalide."""
+    try:
+        return jm.load_conversation(conversation_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Conversation {conversation_id} introuvable")
+    except ValueError as exc:
+        logger.error("Fichier %s.json invalide : %s", conversation_id, exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Fichier conversation corrompu")
+
+def _normalize_conversation_id(raw_id: str) -> str:
+    """
+    Normalise un UUID reçu en path (majuscules/minuscules) en forme canonique lower-case.
+    Ex: 6284B51A-... -> 6284b51a-...
+    """
+    try:
+        return str(UUID(raw_id))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"conversation_id invalide: {raw_id}",
+        )
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/",
+    response_model=List[ConversationResponse],
+    summary="Lister toutes les conversations",
+)
+def list_conversations(
+    jm: JSONManager = Depends(get_json_manager),
+) -> List[ConversationResponse]:
+    """
+    Retourne la liste des métadonnées, triée par updatedAt décroissant
+    (conversation la plus récente en premier).
+    """
+    index = jm.load_index()
+    sorted_index = sorted(index, key=lambda m: m.updatedAt, reverse=True)
+    return [ConversationResponse.from_metadata(m) for m in sorted_index]
+
+
+@router.post(
+    "/",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Créer une conversation",
+)
+def create_conversation(
+    body: CreateConversationRequest,
+    jm: JSONManager = Depends(get_json_manager),
+) -> ConversationResponse:
+    """
+    Crée une nouvelle conversation avec un message system initial.
+
+    Le message system initial garantit la compatibilité avec les modèles
+    Swift qui initialisent messages = [.system(systemPrompt)].
+    """
+    conv_id = str(uuid4())
+    now = _utcnow()
+
+    # Créer la conversation avec message system initial (compat Swift)
+    system_msg = Message(role=Role.system, content=body.systemPrompt)
+    conv = Conversation(
+        id=conv_id,
+        systemPrompt=body.systemPrompt,
+        messages=[system_msg],
+    )
+
+    meta = ConversationMetadata(
+        id=conv_id,
+        title=body.title,
+        systemPrompt=body.systemPrompt,
+        createdAt=now,
+        updatedAt=now,
+        messageCount=0,  # le message system ne compte pas
+    )
+
+    # Sauvegarder fichier puis mettre à jour l'index
+    jm.save_conversation(conv)
+
+    index = jm.load_index()
+    index.append(meta)
+    jm.save_index(index)
+
+    logger.info("Conversation créée : %s (%r)", conv_id, body.title)
+    return ConversationResponse.from_metadata(meta)
+
+
+@router.get(
+    "/{conversation_id}",
+    response_model=ConversationDetailResponse,
+    summary="Détail d'une conversation",
+)
+def get_conversation(
+    conversation_id: str,
+    jm: JSONManager = Depends(get_json_manager),
+) -> ConversationDetailResponse:
+    """
+    Retourne la conversation complète (métadonnées + messages).
+
+    Si {uuid}.json est absent alors que l'entrée index existe,
+    load_index() aura déjà nettoyé l'index → 404 retourné.
+    """
+    conversation_id = _normalize_conversation_id(conversation_id)
+    meta = _get_meta_or_404(conversation_id, jm)
+    conv = _load_conversation_or_404(conversation_id, jm)
+    return ConversationDetailResponse.from_metadata_and_conversation(meta, conv)
+
+
+@router.put(
+    "/{conversation_id}",
+    response_model=ConversationResponse,
+    summary="Modifier le titre d'une conversation",
+)
+def update_conversation(
+    conversation_id: str,
+    body: UpdateConversationRequest,
+    jm: JSONManager = Depends(get_json_manager),
+) -> ConversationResponse:
+    """
+    Modifie le titre. updatedAt est mis à jour, createdAt reste immutable.
+    systemPrompt est immutable (non modifiable via cette API).
+    """
+    conversation_id = _normalize_conversation_id(conversation_id)
+    meta = _get_meta_or_404(conversation_id, jm)
+
+    updated_meta = ConversationMetadata(
+        id=meta.id,
+        title=body.title,
+        systemPrompt=meta.systemPrompt,
+        createdAt=meta.createdAt,
+        updatedAt=_utcnow(),
+        messageCount=meta.messageCount,
+    )
+
+    index = jm.load_index()
+    new_index = [updated_meta if m.id == conversation_id else m for m in index]
+    jm.save_index(new_index)
+
+    logger.info("Conversation %s renommée : %r", conversation_id, body.title)
+    return ConversationResponse.from_metadata(updated_meta)
+
+
+@router.delete(
+    "/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Supprimer une conversation",
+)
+def delete_conversation(
+    conversation_id: str,
+    jm: JSONManager = Depends(get_json_manager),
+) -> None:
+    """
+    Supprime le fichier {uuid}.json et retire l'entrée de l'index.
+
+    Vérifie l'existence avant suppression pour retourner 404
+    plutôt que de réussir silencieusement sur un ID inexistant.
+    """
+    conversation_id = _normalize_conversation_id(conversation_id)
+    _get_meta_or_404(conversation_id, jm)
+
+    try:
+        jm.delete_conversation(conversation_id)
+    except OSError as exc:
+        logger.error("Erreur suppression %s : %s", conversation_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur suppression conversation : {exc}",
+        )
+
+    logger.info("Conversation supprimée : %s", conversation_id)

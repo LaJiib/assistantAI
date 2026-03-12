@@ -12,6 +12,7 @@ struct PromptField: View {
     @State private var task: Task<Void, Never>?
 
     let sendButtonAction: () async -> Void
+    let canSend: Bool
 
     var body: some View {
         HStack {
@@ -32,6 +33,7 @@ struct PromptField: View {
                 Image(systemName: isRunning ? "stop.circle.fill" : "paperplane.fill")
             }
             .keyboardShortcut(isRunning ? .cancelAction : .defaultAction)
+            .disabled(!canSend && !isRunning)
         }
     }
 
@@ -45,6 +47,9 @@ struct PromptField: View {
 }
 
 #Preview {
-    PromptField(prompt: .constant("")) {
-    }
+    PromptField(
+        prompt: .constant(""),
+        sendButtonAction: { },
+        canSend: true
+    )
 }

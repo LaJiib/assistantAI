@@ -5,8 +5,6 @@
 //  Created by JB SENET on 31/01/2026.
 //
 
-import AVFoundation
-import AVKit
 import SwiftUI
 
 /// Main chat interface view that manages the conversation UI and user interactions.
@@ -14,6 +12,7 @@ import SwiftUI
 struct ChatView: View {
     /// View model that manages the chat state and business logic
     @Bindable private var vm: ConversationViewModel
+    @Environment(BackendManager.self) private var backendManager
 
     /// Initializes the chat view with a view model
     /// - Parameter viewModel: The view model to manage chat state
@@ -33,24 +32,27 @@ struct ChatView: View {
                 PromptField(
                     prompt: $vm.prompt,
                     sendButtonAction: vm.generate,
+                    canSend: canSend
                 )
                 .padding()
             }
-            .navigationTitle("MLX Chat Example")
+            .navigationTitle("AssistantIA")
             .toolbar {
                 ChatToolbarView(vm: vm)
             }
         }
     }
+
+    private var canSend: Bool {
+        if case .running = backendManager.state { return true }
+        return false
+    }
 }
 
 #Preview {
-    let service = MLXService()
     let conversation = Conversation(id: UUID(), systemPrompt: "Preview conversation")
     let viewModel = ConversationViewModel(
         conversation: conversation,
-        mlxService: service,
-        onConversationUpdated: { _, _ in },
         onDelete: { }
     )
     ChatView(viewModel: viewModel)

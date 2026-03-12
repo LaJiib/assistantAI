@@ -9,27 +9,12 @@ import SwiftUI
 
 @main
 struct AssistantIAApp: App {
-    @State private var mlxService: MLXService
-    @State private var conversationManager: ConversationManager
-    @State private var modelStateManager: ModelStateManager
-
-    // Phase 2 : BackendManager géré ici — lifecycle lié à l'app entière.
-    // @State garantit une instance unique initialisée une seule fois.
+    @State private var conversationManager = ConversationManager()
     @State private var backendManager = BackendManager()
-
-    init() {
-        let service = MLXService()
-        let manager = ConversationManager(mlxService: service)
-
-        _mlxService = State(initialValue: service)
-        _conversationManager = State(initialValue: manager)
-        _modelStateManager = State(initialValue: ModelStateManager(mlxService: service, conversationManager: manager))
-    }
 
     var body: some Scene {
         WindowGroup {
-            RootView(modelStateManager: modelStateManager,
-                     conversationManager: conversationManager)
+            RootView(conversationManager: conversationManager)
                 // Rend backendManager accessible à toutes les vues enfants
                 .environment(backendManager)
                 // Démarrage backend asynchrone : UI s'affiche immédiatement,
@@ -50,7 +35,9 @@ struct AssistantIAApp: App {
         }
     }
 
-    /// Lance le backend et absorbe les erreurs — l'état est visible via backendManager.state.
+    /// Lance le backend puis charge les conversations depuis l'API.
+    /// Les erreurs sont absorbées — l'état est visible via backendManager.state
+    /// et conversationManager.loadError.
     @MainActor
     private func startBackend() async {
         do {
@@ -58,9 +45,19 @@ struct AssistantIAApp: App {
         } catch is CancellationError {
             // App quittée pendant le démarrage : arrêter le process si encore actif
             backendManager.stop()
+            return
         } catch {
             // Échec startup : backendManager.state est déjà .error avec le message
             print("[App] ⚠️ Backend startup échoué : \(error.localizedDescription)")
+            return
+        }
+
+        // Backend prêt → charger les conversations depuis l'API
+        do {
+            try await conversationManager.loadConversations()
+        } catch {
+            // Erreur exposée via conversationManager.loadError — pas de crash
+            print("[App] ⚠️ Chargement conversations échoué : \(error.localizedDescription)")
         }
     }
 }

@@ -17,4 +17,10 @@ struct Conversation: Identifiable, Codable, Equatable {
         self.systemPrompt = systemPrompt
         self.messages = [.system(systemPrompt)]
     }
+
+    init(id: UUID, systemPrompt: String, messages: [Message]) {
+        self.id = id
+        self.systemPrompt = systemPrompt
+        self.messages = messages
+    }
 }

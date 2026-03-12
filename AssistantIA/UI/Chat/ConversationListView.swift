@@ -42,13 +42,14 @@ struct ConversationListView: View {
         .navigationTitle("Conversations")
         .toolbar{
             Button {
-                manager.createConversation()
+                // createConversation() est async (UUID généré par le backend)
+                Task { try? await manager.createConversation() }
             } label: {
                 Label("New Conversation", systemImage: "plus")
             }
         }
     }
-    
+
     func deleteConversations(at offsets: IndexSet) {
         let sorted = manager.metadata.sorted { $0.updatedAt > $1.updatedAt }
         for index in offsets {

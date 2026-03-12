@@ -25,6 +25,13 @@ struct Message: Identifiable, Equatable, Codable {
         self.content = content
         self.timestamp = Date()
     }
+
+    init(id: UUID, role: Role, content: String, timestamp: Date) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.timestamp = timestamp
+    }
 }
 
 extension Message {

@@ -4,10 +4,10 @@
 Agent autonome cognitif avec mémoires, planning, meta-prompting, initiatives.
 
 ## État Actuel
-- [x] App Swift fonctionnelle avec MLX
-- [x] Backend Python
-- [ ] Dual mode Swift/Python
-- [ ] RAG
+- [x] App Swift fonctionnelle avec MLX (Phase 1)
+- [x] Backend Python + migration frontend (Phase 2)
+- [x] API REST conversations/messages + UI nettoyée (Phase 2bis)
+- [ ] RAG ChromaDB (Phase 3)
 - [ ] Tool calling
 - [ ] Mémoires
 - [ ] Planning autonome
@@ -553,15 +553,208 @@ Core/Utilities/ModelStateManager.swift # Conservé, non utilisé
 | PYTHONPATH/VIRTUAL_ENV reconstruits manuellement | `resolvingSymlinksInPath()` + Sandbox = impossible d'utiliser l'activation venv classique |
 | Auto-restart max 1× après crash | Évite restart infini si bug persistant ; laisse l'utilisateur décider |
 
+## PHASE 2bis : Migration responsabilité métier vers backend ✅ COMPLÉTÉE
+
+**Dates** : 2026-03-12
+
+### Objectif
+
+Migrer la responsabilité de gestion des conversations du frontend Swift vers le backend Python. Les données restent au même emplacement (SSD externe partagé), seule la couche d'accès change. Le frontend devient UI pure consommant une API REST. Supprimer tous les artefacts de l'ancienne architecture Swift MLX (boutons Load/Unload, progress bars, tok/s, SetupView).
+
+### Fichiers créés (Backend)
+
+- **`backend/models/conversation.py`** (68 lignes)
+  - Pydantic v2 models : `Role` (str enum), `Message`, `ConversationMetadata`, `Conversation`
+  - `@field_serializer` sur tous les champs `datetime` → ISO 8601 avec offset UTC (`+00:00`)
+  - Décision : `@field_serializer` plutôt que `Config.json_encoders` (Pydantic v2, non déprécié)
+
+- **`backend/storage/json_manager.py`** (206 lignes)
+  - `JSONManager` : CRUD fichiers JSON + index `conversations.json`
+  - `threading.Lock()` global pour toutes les I/O — protège contre accès concurrents
+  - `load_index()` : auto-cleanup des entrées orphelines (index présent, `{uuid}.json` absent)
+  - `verify_integrity()` → `{"cleaned": N}` — appelé au démarrage backend
+  - Décision : `_read_index_file()` retourne `[]` gracieusement si fichier absent ou JSON invalide
+
+- **`backend/api/conversations.py`** (329 lignes)
+  - `APIRouter(prefix="/api/conversations")` — CRUD complet
+  - DTO séparés : `CreateConversationRequest`, `UpdateConversationRequest`, `ConversationResponse`
+  - `createdAt` immutable ; `updatedAt` rafraîchi au PUT
+  - Liste triée par `updatedAt` décroissant
+  - HTTP 201 POST, 204 DELETE, 404 conversation inconnue, 422 validation
+
+- **`backend/api/messages.py`** (401 lignes)
+  - `APIRouter(prefix="/api/conversations/{conversation_id}/messages")`
+  - Lock par conversation (`dict[str, Lock]`) pour écriture concurrente safe
+  - `GET /` : exclut les messages `system`
+  - `POST /` : sauvegarde user → génère → sauvegarde assistant → 201
+  - `POST /stream` : sauvegarde user → SSE stream → sauvegarde assistant en `finally` (partiel si disconnect)
+  - `_build_messages_for_llm()` : historique complet → `List[Dict]` pour `apply_chat_template`
+
+- **`backend/tests/test_json_manager.py`** (276 lignes) — 16 tests
+- **`backend/tests/test_conversations_api.py`** (291 lignes) — 24 tests
+- **`backend/tests/test_messages_api.py`** (416 lignes) — 20 tests
+  - `MockEngine`, `FailingEngine`, `UnloadedEngine`, `CapturingEngine` — pas de modèle MLX requis
+
+### Fichiers créés (Frontend)
+
+- **`AssistantIA/Core/Services/ConversationAPI.swift`** (441 lignes)
+  - `actor ConversationAPI` — isolation garantit thread-safety sans lock manuel
+  - DTO privés (`APIMessage`, `APIConversation`, `APIConversationMetadata`) séparés des modèles UI
+  - `makeDecoder()` : deux `ISO8601DateFormatter` en cascade (avec/sans microsecondes) — `.iso8601` natif échoue sur `datetime.isoformat()` Python (microsecondes)
+  - `nonisolated func sendMessage()` → `AsyncThrowingStream<String, Error>` (streaming SSE)
+  - `continuation.onTermination = { _ in task.cancel() }` — cancellation propagée vers URLSession
+  - Erreurs typées : `networkError`, `notFound`, `modelLoading`, `serverError`, `decodingError`, `streamError`, `cancelled`
+
+- **`AssistantIA/Core/Services/BackendAdminAPI.swift`** (63 lignes)
+  - Client admin typé : `health()` → `BackendHealth` (status, modelLoaded, modelName, pid)
+  - `keyDecodingStrategy = .convertFromSnakeCase` — évite mapping manuel snake→camel
+
+### Fichiers modifiés (Backend)
+
+- **`backend/main.py`** (147 → 221 lignes)
+  - Migration `@app.on_event` (déprécié) → `@asynccontextmanager lifespan`
+  - Chargement modèle en tâche de fond `asyncio.create_task(_load_model())` — HTTP disponible immédiatement, conversations chargées avant fin de chargement modèle
+  - `app.state.json_manager` initialisé + `verify_integrity()` au startup
+  - `app.include_router(conversations_router)` + `app.include_router(messages_router)` — routes absentes en Phase 2 (cause des 404)
+  - `/health` enrichi avec `pid` — BackendManager vérifie PID pour éviter faux "backend prêt" si port déjà occupé
+  - `MAX_GENERATION_TOKENS` / `MAX_GENERATION_TEMPERATURE` via `.env` — plafond serveur appliqué sur `/chat`, `/chat/stream`, `/messages`, `/messages/stream`
+  - `app.state.engine` initialisé à `None` dès le démarrage — évite `AttributeError` avant fin de chargement
+
+- **`backend/core/llm.py`** (123 lignes)
+  - `stream_messages(messages: List[Dict])` → `apply_chat_template` pour multi-turn
+  - `generate_messages(messages)` → collecte le stream
+  - `stream()` et `generate()` délèguent à `stream_messages()` — rétrocompatibilité Phase 2
+
+- **`backend/.env.example`**
+  - Ajout `DATA_FOLDER=/Volumes/AISSD/conversations`
+  - Ajout `MAX_GENERATION_TOKENS=512` + `MAX_GENERATION_TEMPERATURE=0.3`
+
+### Fichiers modifiés (Frontend)
+
+- **`AssistantIA/Core/Utilities/ConversationManager.swift`** (refactorisé → 199 lignes)
+  - Supprimé : `ConversationStorageError`, `dataFolderURL`, `setDataFolderURL()`, `loadIndex()`, `saveIndex()`, `loadMessages()`, `saveMessages()`, `indexFileURL()`, `conversationFileURL()`
+  - Ajouté : `conversationAPI: ConversationAPI`, `loadError: String?`, `loadConversations() async throws`
+  - `createConversation()` → `async throws` (UUID généré par le backend)
+  - `deleteConversation()` / `renameConversation()` → optimistic local update + fire-and-forget `Task`
+  - `getViewModel()` → placeholder sync + `Task` charge les vrais messages → `@Observable` re-render automatique
+  - `viewModelCache[UUID]` — préserve l'état UI (isGenerating, prompt) si on revient sur une conversation
+  - `init(conversationAPI:)` — `mlxService` supprimé (plus nécessaire)
+
+- **`AssistantIA/UI/Chat/ConversationViewModel.swift`** (simplifié → 179 lignes)
+  - Supprimé : `onConversationUpdated`, `tokensPerSecond`, `modelDownloadProgress`, `buildPrompt()`, `mlxService`
+  - `generate()` : `for try await chunk in conversationAPI.sendMessage()` — streaming direct
+  - Annulation : message partiel conservé avec `\n[Annulé]` — cohérent avec ce que le backend a sauvegardé
+  - `generateTitleWithAI()` : `ChatAPI.shared.sendMessage()` — stateless, n'ajoute pas de message à l'historique
+  - Erreur réseau → `errorMessage` affiché dans l'UI
+
+- **`AssistantIA/Core/Services/BackendManager.swift`** (360 lignes)
+  - `checkHealth()` consomme `BackendAdminAPI.health()` → `BackendHealth` typé
+  - `waitForBackendReady()` : vérifie PID du health check contre PID du process lancé — évite faux positif si port déjà occupé par instance précédente
+  - `handleProcessTermination()` : gère crash pendant `.starting` séparément de crash pendant `.running`
+  - `restartAttempts` réinitialisé à 0 au démarrage propre
+  - `baseURL: URL` exposé — consommé par `BackendAdminAPI`
+
+- **`AssistantIA/Application/AssistantIAApp.swift`** (63 lignes)
+  - `startBackend()` : `backendManager.start()` attend que le serveur HTTP soit prêt (pas nécessairement le modèle), puis `conversationManager.loadConversations()` — conversations disponibles avant fin de chargement modèle
+  - Catch séparé pour erreur backend vs erreur chargement conversations
+
+- **`AssistantIA/UI/Chat/ConversationListView.swift`**
+  - `createConversation()` wrappé dans `Task { try? await ... }`
+
+- **`AssistantIA/UI/RootView.swift`** — supprimé `modelControlToolbar`, `modelStateManager`, routing `SetupView`, bannière "Model not loaded"
+
+- **`AssistantIA/UI/Chat/ChatView.swift`** — titre "MLX Chat Example" → "AssistantIA"
+
+- **`AssistantIA/UI/Chat/Components/Toolbar/ChatToolbarView.swift`** — supprimé `DownloadProgressView` + `GenerationInfoView`
+
+- **`AssistantIA/UI/Settings/BackendSettingsView.swift`** — amélioré : bouton envoyer désactivé tant que modèle non prêt, statut backend déplacé/agrandi dans toolbar
+
+### Fichiers supprimés (Frontend)
+
+- `AssistantIA/Core/Utilities/ModelStateManager.swift` — plus aucun usage
+- `AssistantIA/UI/Chat/SetupView.swift` — routing conditionnel MLX supprimé
+- `AssistantIA/UI/Chat/Components/Toolbar/DownloadProgressView.swift` — artefact MLX
+- `AssistantIA/UI/Chat/Components/Toolbar/GenerationInfoView.swift` — affichait tok/s MLX local
+
+### Performance mesurée Phase 2bis
+
+| Métrique | Valeur | Seuil | Statut |
+|---|---|---|---|
+| GET /api/conversations/ (vide) | < 5ms | < 20ms | ✅ |
+| POST /api/conversations/ | < 10ms | < 50ms | ✅ |
+| GET /api/conversations/{id} | < 5ms | < 20ms | ✅ |
+| Throughput génération | ~17 tok/s | >= 10 tok/s | ✅ |
+| Startup backend (HTTP prêt) | < 1s | < 5s | ✅ |
+| Chargement modèle (bg task) | ~35s | < 60s | ✅ |
+| Conversations disponibles avant modèle chargé | ✅ | — | ✅ |
+
+> **Note** : Le chargement modèle est désormais en tâche de fond — l'UI et les conversations sont disponibles ~34s avant la fin du chargement du modèle.
+
+### Tests validation Phase 2bis
+
+- [x] `test_json_manager.py` — 16 tests ✅ (CRUD, auto-cleanup, ISO 8601, verify_integrity)
+- [x] `test_conversations_api.py` — 24 tests ✅ (CRUD, 404/422, tri, datetime)
+- [x] `test_messages_api.py` — 20 tests ✅ (GET/POST/stream, mock engine, 503, multi-turn)
+- [x] `test_basic.py` — 4 tests (nécessitent backend running — validation manuelle)
+- [x] Frontend liste conversations via API
+- [x] Frontend CRUD fonctionne (create, rename, delete)
+- [x] Chat streaming backend → messages auto-sauvegardés
+- [x] UI nettoyée — aucun artefact MLX visible
+- [x] Backend down → `errorMessage` clair dans le ViewModel
+- [x] Cancel mid-génération → message partiel `[Annulé]` + backend sauvegarde le partiel
+- [x] Conversations disponibles avant fin chargement modèle
+
+### Problèmes rencontrés
+
+**1. Routes API conversations → 404 au démarrage**
+- Cause : `app.include_router(conversations_router)` absent de `main.py` — oublié en fin de Phase 2bis-A
+- Solution : ajout des deux `include_router` + initialisation `app.state.json_manager` dans `lifespan`
+
+**2. Tests 404 retournaient 422**
+- Cause : tests utilisaient `"ghost-id"` / `"nonexistent-uuid"` (pas des UUIDs valides) — le backend valide le format UUID avant de chercher la ressource → 422 correct
+- Solution : remplacer par `"00000000-0000-0000-0000-000000000000"` (UUID valide mais inexistant)
+
+**3. `on_event` startup/shutdown déprécié**
+- Solution : migration vers `@asynccontextmanager lifespan(app)` — API officielle FastAPI
+
+**4. `app.state.engine` AttributeError avant chargement modèle**
+- Cause : `app.state.engine` n'existait pas avant fin de `_load_model()` — les endpoints `/chat` accédaient à `app.state.engine` pendant le chargement
+- Solution : `app.state.engine = None` avant `asyncio.create_task(_load_model())` + `getattr(app.state, "engine", None)` dans les endpoints
+
+**5. `dateDecodingStrategy = .iso8601` échoue sur les datetimes Python**
+- Cause : `datetime.isoformat()` Python produit `"2026-03-12T10:30:00.123456+00:00"` (microsecondes + offset `+00:00`) — `.iso8601` de Swift ne supporte pas les microsecondes
+- Solution : deux `ISO8601DateFormatter` en cascade dans `makeDecoder()` — avec `.withFractionalSeconds` en premier, fallback sans
+
+**6. Chargement modèle bloquait le démarrage HTTP**
+- Cause : dans l'ancienne version, `startup()` chargeait le modèle de façon synchrone — le serveur ne démarrait qu'après
+- Solution : `asyncio.create_task(_load_model())` — HTTP disponible immédiatement, modèle chargé en fond
+
+**7. `mx.metal.clear_cache()` → API dépréciée**
+- Solution : `mx.clear_cache()` (API correcte dans mlx >= 0.21)
+
+### Décisions techniques Phase 2bis
+
+| Décision | Justification |
+|---|---|
+| JSON (pas SQLite) | Debug facile — fichiers lisibles directement ; zéro migration depuis Phase 2 ; versionnable |
+| `threading.Lock()` global (pas par conv) | Simplicité — index partagé nécessite lock global ; overhead négligeable en usage réel |
+| `@field_serializer` Pydantic v2 | `Config.json_encoders` déprécié en Pydantic v2 |
+| ISO 8601 avec microsecondes + offset `+00:00` | `datetime.isoformat()` Python natif ; compatible Swift via formatters en cascade |
+| `asyncio.create_task` pour modèle | Conversations ne nécessitent pas le modèle — disponibles ~34s plus tôt |
+| DTO privés dans ConversationAPI | Contrat réseau découplé des modèles UI — backend peut évoluer sans toucher les modèles Swift |
+| `actor ConversationAPI` (pas `final class`) | Méthodes mutent `session`/`decoder` → actor obligatoire ; `nonisolated` pour le stream |
+| Optimistic update delete/rename | UX fluide — pas d'attente réseau pour opérations locales |
+| Sauvegarde SSE dans `finally` | Une seule écriture disque par génération ; sauvegarde partielle si client se déconnecte |
+| `buildPrompt()` conservé (workaround) | API `/chat` accepte `prompt: str` — migration vers `messages: List[Dict]` en Phase 3 |
+| Bouton envoyer désactivé si modèle non prêt | UX : évite erreur 503 visible ; stop reste accessible si génération en cours |
+
 ### Observations pour Phase 3
 
-- **API multi-turn** : priorité #1 — le backend doit accepter `messages: List[Dict]` pour que
-  la génération tienne compte de l'historique. `buildPrompt()` est un workaround fonctionnel.
-- **Startup lent** : 35s avec SSD externe. Phase 3 pourrait investiguer "model already loaded"
-  si le process backend reste entre les sessions (pas de stop au quit, option avancée).
-- **Tok/s** : toujours ~17 tok/s (overhead Python). Phase 3+ pourrait tester modèle 4-bit (~35 tok/s).
-- **Logs réseau** : même à 2s, URLSession génère du bruit. Phase 3 : custom TCP socket pour
-  health check, ou supprimer les logs `nw_*` via `OS_ACTIVITY_MODE=disable`.
+- **Multi-turn natif** : `stream_messages(messages: List[Dict])` est en place côté backend. Il faut migrer `ConversationViewModel` pour passer l'historique complet plutôt que `buildPrompt()` (concaténation texte).
+- **JSONManager extensible** : peut stocker des embeddings vectoriels par message (champ `embedding: List[float]`) sans modifier la structure — base naturelle pour RAG.
+- **Pattern DTO privés réutilisable** : `ConversationAPI` pourra exposer des events tool-call via le stream SSE sans modifier les types Swift publics.
+- **`AsyncThrowingStream` déjà prêt** : le stream SSE peut véhiculer des événements typés (`tool_call`, `tool_result`, `text`) sans changer l'interface consommateur.
+- **Startup lent atténué** : avec le chargement modèle en fond, l'UX s'améliore même à 35s. Phase 3 pourra investiguer le keep-alive du process backend entre sessions.
 
 ---
 

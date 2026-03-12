@@ -32,8 +32,8 @@ final class ChatAPI {
     /// Génération complète : POST /chat → retourne la réponse en une fois.
     func sendMessage(
         _ prompt: String,
-        maxTokens: Int = 512,
-        temperature: Float = 0.3
+        maxTokens: Int? = nil,
+        temperature: Float? = nil
     ) async throws -> String {
         var request = makeRequest(path: "/chat")
         let body = ChatRequest(prompt: prompt, max_tokens: maxTokens, temperature: temperature)
@@ -56,8 +56,8 @@ final class ChatAPI {
     /// ```
     func streamMessage(
         _ prompt: String,
-        maxTokens: Int = 512,
-        temperature: Float = 0.3
+        maxTokens: Int? = nil,
+        temperature: Float? = nil
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -181,8 +181,8 @@ final class ChatAPI {
 
 private struct ChatRequest: Encodable {
     let prompt: String
-    let max_tokens: Int
-    let temperature: Float
+    let max_tokens: Int?
+    let temperature: Float?
 }
 
 private struct ChatResponse: Decodable {

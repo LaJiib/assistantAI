@@ -10739,6 +10739,20 @@
 		2EF6F3AE2F61A0500009CC77 /* main.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "main.cpython-314.pyc"; sourceTree = "<group>"; };
 		2EF6F3B22F61A09D0009CC77 /* __init__.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "__init__.cpython-314.pyc"; sourceTree = "<group>"; };
 		2EF6F3B32F61A09D0009CC77 /* llm.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "llm.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F43B2F62C9700009CC77 /* __init__.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "__init__.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F43C2F62C9700009CC77 /* conversations.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "conversations.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F43D2F62C9700009CC77 /* messages.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "messages.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F43F2F62C9700009CC77 /* __init__.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = __init__.py; sourceTree = "<group>"; };
+		2EF6F4402F62C9700009CC77 /* conversations.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = conversations.py; sourceTree = "<group>"; };
+		2EF6F4412F62C9700009CC77 /* messages.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = messages.py; sourceTree = "<group>"; };
+		2EF6F4432F62C9800009CC77 /* __init__.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "__init__.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F4442F62C9800009CC77 /* conversation.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "conversation.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F4462F62C9800009CC77 /* __init__.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = __init__.py; sourceTree = "<group>"; };
+		2EF6F4472F62C9800009CC77 /* conversation.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = conversation.py; sourceTree = "<group>"; };
+		2EF6F4492F62C9910009CC77 /* __init__.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "__init__.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F44A2F62C9910009CC77 /* json_manager.cpython-314.pyc */ = {isa = PBXFileReference; lastKnownFileType = file; path = "json_manager.cpython-314.pyc"; sourceTree = "<group>"; };
+		2EF6F44C2F62C9910009CC77 /* __init__.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = __init__.py; sourceTree = "<group>"; };
+		2EF6F44D2F62C9910009CC77 /* json_manager.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = json_manager.py; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -10812,6 +10826,9 @@
 		2EF6C3152F617C140009CC77 /* backend */ = {
 			isa = PBXGroup;
 			children = (
+				2EF6F44E2F62C9910009CC77 /* storage */,
+				2EF6F4482F62C9800009CC77 /* models */,
+				2EF6F4422F62C9700009CC77 /* api */,
 				2EF6F3AF2F61A0500009CC77 /* __pycache__ */,
 				2EF6F3AD2F61A0350009CC77 /* venv */,
 				2EF6C31E2F61819B0009CC77 /* .env.example */,
@@ -34430,6 +34447,65 @@
 				2EF6F3B32F61A09D0009CC77 /* llm.cpython-314.pyc */,
 			);
 			path = __pycache__;
+			sourceTree = "<group>";
+		};
+		2EF6F43E2F62C9700009CC77 /* __pycache__ */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6F43B2F62C9700009CC77 /* __init__.cpython-314.pyc */,
+				2EF6F43C2F62C9700009CC77 /* conversations.cpython-314.pyc */,
+				2EF6F43D2F62C9700009CC77 /* messages.cpython-314.pyc */,
+			);
+			path = __pycache__;
+			sourceTree = "<group>";
+		};
+		2EF6F4422F62C9700009CC77 /* api */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6F43E2F62C9700009CC77 /* __pycache__ */,
+				2EF6F43F2F62C9700009CC77 /* __init__.py */,
+				2EF6F4402F62C9700009CC77 /* conversations.py */,
+				2EF6F4412F62C9700009CC77 /* messages.py */,
+			);
+			path = api;
+			sourceTree = "<group>";
+		};
+		2EF6F4452F62C9800009CC77 /* __pycache__ */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6F4432F62C9800009CC77 /* __init__.cpython-314.pyc */,
+				2EF6F4442F62C9800009CC77 /* conversation.cpython-314.pyc */,
+			);
+			path = __pycache__;
+			sourceTree = "<group>";
+		};
+		2EF6F4482F62C9800009CC77 /* models */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6F4452F62C9800009CC77 /* __pycache__ */,
+				2EF6F4462F62C9800009CC77 /* __init__.py */,
+				2EF6F4472F62C9800009CC77 /* conversation.py */,
+			);
+			path = models;
+			sourceTree = "<group>";
+		};
+		2EF6F44B2F62C9910009CC77 /* __pycache__ */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6F4492F62C9910009CC77 /* __init__.cpython-314.pyc */,
+				2EF6F44A2F62C9910009CC77 /* json_manager.cpython-314.pyc */,
+			);
+			path = __pycache__;
+			sourceTree = "<group>";
+		};
+		2EF6F44E2F62C9910009CC77 /* storage */ = {
+			isa = PBXGroup;
+			children = (
+				2EF6F44B2F62C9910009CC77 /* __pycache__ */,
+				2EF6F44C2F62C9910009CC77 /* __init__.py */,
+				2EF6F44D2F62C9910009CC77 /* json_manager.py */,
+			);
+			path = storage;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */

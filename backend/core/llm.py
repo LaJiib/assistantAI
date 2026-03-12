@@ -3,14 +3,16 @@ MinistralEngine — wrapper mlx-lm pour Ministral 3 14B Instruct.
 
 Cycle de vie :
     engine = MinistralEngine(model_path)
-    await engine.load()             # startup FastAPI
-    engine.stream(prompt, ...)      # sync, itère des chunks texte
-    engine.generate(prompt, ...)    # sync, retourne le texte complet
+    await engine.load()                       # startup FastAPI
+    engine.stream(prompt, ...)                # sync, itère des chunks texte (compat Phase 2)
+    engine.generate(prompt, ...)              # sync, retourne le texte complet (compat Phase 2)
+    engine.stream_messages(messages, ...)     # sync, multi-turn via historique messages
+    engine.generate_messages(messages, ...)   # sync, multi-turn, retourne texte complet
 """
 
 import asyncio
 import logging
-from typing import Iterator
+from typing import Dict, Iterator, List
 
 from mlx_lm import load as mlx_load, stream_generate
 from mlx_lm.sample_utils import make_sampler
@@ -45,24 +47,29 @@ class MinistralEngine:
         self._is_loaded = True
         logger.info(f"✅ Modèle chargé : {self.model_name}")
 
-    def stream(
+    # ── Génération à partir d'un historique de messages ───────────────────────
+
+    def stream_messages(
         self,
-        prompt: str,
+        messages: List[Dict[str, str]],
         max_tokens: int = 512,
         temperature: float = 0.3,
     ) -> Iterator[str]:
         """
-        Génère le texte chunk par chunk via stream_generate.
-        Synchrone — appellé depuis un endpoint FastAPI def (non-async).
+        Génère le texte chunk par chunk depuis un historique de messages.
 
-        Phase 4 : remplacer la liste messages par [{"role": ...}, ...]
-        pour supporter le contexte conversationnel et le tool calling.
+        Args:
+            messages: liste de dicts {"role": "user"|"assistant"|"system", "content": str}
+                      dans l'ordre chronologique. Le tokenizer applique le chat template
+                      natif du modèle → support multi-turn correct.
+
+        Synchrone — appelé depuis un endpoint FastAPI def (non-async).
         """
         if not self._is_loaded:
             raise RuntimeError("Modèle non chargé. Appelez await engine.load() d'abord.")
 
         formatted = self._tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -84,6 +91,33 @@ class MinistralEngine:
                 f"@ {last.generation_tps:.1f} tok/s"
             )
 
+    def generate_messages(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 512,
+        temperature: float = 0.3,
+    ) -> str:
+        """Retourne le texte complet depuis un historique de messages."""
+        return "".join(self.stream_messages(messages, max_tokens, temperature))
+
+    # ── API compat Phase 2 (prompt texte brut) ────────────────────────────────
+
+    def stream(
+        self,
+        prompt: str,
+        max_tokens: int = 512,
+        temperature: float = 0.3,
+    ) -> Iterator[str]:
+        """
+        Génère depuis un prompt texte brut (compat Phase 2 / /chat endpoint).
+        Délègue à stream_messages() avec un message user unique.
+        """
+        return self.stream_messages(
+            [{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
     def generate(self, prompt: str, max_tokens: int = 512, temperature: float = 0.3) -> str:
-        """Retourne le texte complet en collectant stream()."""
+        """Retourne le texte complet (compat Phase 2)."""
         return "".join(self.stream(prompt, max_tokens, temperature))

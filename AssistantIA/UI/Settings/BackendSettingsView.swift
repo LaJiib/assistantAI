@@ -165,7 +165,7 @@ struct BackendSettingsView: View {
     private var infoSection: some View {
         Section("Informations") {
             LabeledContent("URL") {
-                Text("http://127.0.0.1:8000")
+                Text(backendManager.baseURL.absoluteString)
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)

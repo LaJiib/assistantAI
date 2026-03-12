@@ -44,6 +44,10 @@ final class BackendManager {
         return Int(p.processIdentifier)
     }
 
+    var baseURL: URL {
+        URL(string: "http://\(host):\(port)")!
+    }
+
     // MARK: - Config
 
     private let backendPath: String
@@ -51,6 +55,7 @@ final class BackendManager {
     private let host = "127.0.0.1"
     private let port = 8000
     private let startupTimeout: TimeInterval = 30
+    @ObservationIgnored private let adminAPI: BackendAdminAPI
 
     /// Nombre de redémarrages automatiques tentés après crash.
     private var restartAttempts = 0
@@ -67,6 +72,7 @@ final class BackendManager {
     init() {
         let repoRoot = Self.findRepoRoot()
         backendPath = "\(repoRoot)/backend"
+        adminAPI = BackendAdminAPI(baseURL: URL(string: "http://127.0.0.1:8000")!)
         // Résoudre le double symlink python → python3.14 → /opt/homebrew/...
         // Process.run() échoue si l'exécutable est un symlink vers un chemin hors sandbox.
         let symlinkPath = "\(repoRoot)/backend/venv/bin/python"
@@ -109,7 +115,6 @@ final class BackendManager {
 
         state = .starting
         stderrBuffer = ""
-        restartAttempts = 0
         print("[BackendManager] 🚀 Démarrage backend...")
 
         try await launchProcess()
@@ -137,15 +142,13 @@ final class BackendManager {
         }
     }
 
-    /// Health check ponctuel : GET /health → retourne le JSON ou lance une erreur.
-    func checkHealth() async throws -> [String: Any] {
-        let url = URL(string: "http://\(host):\(port)/health")!
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+    /// Health check ponctuel : GET /health → retourne l'état backend typé.
+    func checkHealth() async throws -> BackendHealth {
+        do {
+            return try await adminAPI.health()
+        } catch {
             throw BackendError.unhealthy
         }
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        return json
     }
 
     // MARK: - Private: Process Launch
@@ -259,12 +262,28 @@ final class BackendManager {
             if case .error = state {
                 throw BackendError.startupFailed(stderrBuffer)
             }
+            // Process mort pendant startup: ne pas valider un autre backend déjà sur le port.
+            guard let currentProcess = process, currentProcess.isRunning else {
+                let errMsg = "Backend arrêté pendant le démarrage.\n\(stderrBuffer.suffix(500))"
+                state = .error(errMsg)
+                throw BackendError.startupFailed(errMsg)
+            }
 
             do {
                 let health = try await checkHealth()
-                let modelLoaded = health["model_loaded"] as? Bool ?? false
+                let modelLoaded = health.modelLoaded
+                let healthPID = health.pid
+                let expectedPID = Int(currentProcess.processIdentifier)
+
+                // Si un autre process répond sur 8000, on attend notre propre instance.
+                guard healthPID == expectedPID else {
+                    print("[BackendManager] ⏳ Port \(port) occupé par un autre backend (pid \(healthPID)), attente de l'instance pid \(expectedPID)...")
+                    try await Task.sleep(nanoseconds: pollInterval)
+                    continue
+                }
 
                 if modelLoaded {
+                    restartAttempts = 0
                     state = .running(port: port)
                     print("[BackendManager] ✅ Backend prêt — model_loaded=true, port:\(port)")
                     return
@@ -291,6 +310,12 @@ final class BackendManager {
         let code = proc.terminationStatus
 
         // Si on a nous-mêmes arrêté le process (stop() set state = .stopped avant), ignorer
+        if case .stopped = state { return }
+        if case .starting = state {
+            state = .error("Backend arrêté pendant le démarrage (code: \(code)).")
+            print("[BackendManager] ❌ Backend arrêté pendant startup (code: \(code))")
+            return
+        }
         guard case .running = state else { return }
 
         print("[BackendManager] ⚠️ Backend terminé inopinément (code: \(code))")

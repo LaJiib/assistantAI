@@ -758,10 +758,453 @@ Migrer la responsabilité de gestion des conversations du frontend Swift vers le
 
 ---
 
-## PHASE 3 : RAG ChromaDB ⏳ PLANIFIÉE
+## PHASE 3 : Tool Calling System (EN COURS)
 
-**Objectif** : Indexation documents, recherche vectorielle, injection contexte RAG dans prompts.
+### Objectif
+Implémenter un système de tool calling natif exploitant les capacités de Ministral 3 14B Instruct, avec une architecture évolutive permettant l'auto-génération d'outils et l'apprentissage des patterns d'usage.
 
-**Prérequis** : Phase 2 validée ✅
+### Contraintes non-négociables
 
-(Détails à définir après Phase 2)
+#### Format Tool Calling
+- **Standard OpenAI STRICT** : Le format est celui défini par OpenAI function calling spec, adopté par Mistral AI
+- **Documentation de référence** :
+  - OpenAI : https://platform.openai.com/docs/guides/function-calling
+  - Mistral AI : https://docs.mistral.ai/capabilities/function_calling/
+- **Structure exacte** : `{"type": "function", "function": {"name": ..., "description": ..., "parameters": {"type": "object", "properties": {...}, "required": [...]}}}`
+- **Non-modifiable** : Clés `type`, `function`, `parameters`, structure imbriquée
+- **parameters.type** : TOUJOURS `"object"` même pour un seul paramètre
+- **Types JSON Schema** : Uniquement `string`, `number`, `boolean`, `array`, `object`
+- **Validation obligatoire** : Chaque tool schema doit être validé avant injection au modèle
+
+#### Architecture
+- **Registry centralisé** : Singleton ou DI via FastAPI, mais un seul point d'enregistrement
+- **Permissions granulaires** : Système à 6 niveaux (READ_ONLY, WRITE_SAFE, WRITE_MODIFY, SYSTEM_EXEC, NETWORK, AUTONOMOUS)
+- **Idempotence** : Les outils doivent produire le même résultat si appelés plusieurs fois avec les mêmes args
+- **Isolation** : Chaque outil s'exécute dans son scope, pas de variables globales partagées
+- **Métadonnées riches** : success_count, failure_count, last_used, created_by, version
+- **Découplage total** : Les outils ne dépendent pas de MinistralEngine ou FastAPI
+
+#### Sécurité
+- **Validation des outils générés** : AST parsing pour détecter imports/code dangereux
+  - Interdits : `eval`, `exec`, `compile`, `__import__`, `os.system`, `subprocess`
+  - AST walker pour détecter ces patterns avant ajout au registry
+- **Confirmation obligatoire** : Flag `requires_confirmation` pour outils destructifs (WRITE_MODIFY+)
+- **Review humaine** : Tous les outils auto-générés passent par validation utilisateur
+- **Validation arguments** : Pydantic validation stricte avant exécution
+- **Timeout** : Chaque outil a timeout configurable (default 30s, max 300s)
+- **Audit trail** : Toutes exécutions loggées (timestamp, tool_name, args, result, duration, error)
+- **Pas de vrai sandbox** : Pas de container Docker, juste validation AST + review + timeout
+
+#### Performance
+- **Async-first** : Tous les outils sont `async def`, même si implémentation sync (via `asyncio.to_thread`)
+- **Registry thread-safe** : `asyncio.Lock` pour toutes les mutations du registry
+- **Lazy loading** : Les outils ne sont pas chargés en mémoire tant qu'ils ne sont pas appelés
+- **Tool injection overhead** : < 50ms pour formater et injecter les tools dans le prompt
+- **Parsing overhead** : < 50ms pour parser la réponse et extraire tool calls
+- **Caching optionnel** : Les outils peuvent déclarer `cacheable=True` pour résultats déterministes
+
+#### Évolutivité
+- **Découplage** : Les outils vivent dans `backend/tools/`, séparés de `core/`
+- **Hot-reload** : Possibilité d'ajouter/modifier des outils sans redémarrer le backend (reload du registry)
+- **Versioning** : Chaque outil a une version sémantique (1.0.0), possibilité de rollback
+- **Categories hiérarchiques** : `system`, `filesystem`, `web`, `communication`, `data`, `custom`
+- **Plugin system** : Architecture permet d'ajouter des outils via packages Python externes
+
+### Architecture cible
+```
+backend/
+├── core/
+│   └── tools/
+│       ├── __init__.py
+│       ├── schema.py          # ToolSchema, ToolParameter (Pydantic v2)
+│       ├── registry.py        # ToolRegistry (singleton ou DI)
+│       ├── executor.py        # ToolExecutor (timeout + error handling)
+│       └── validator.py       # ToolValidator (AST + security checks)
+├── tools/
+│   ├── __init__.py
+│   ├── builtin/               # Outils système non-modifiables
+│   │   ├── __init__.py
+│   │   ├── system.py          # get_time, get_date, get_system_info
+│   │   ├── filesystem.py      # read_file, write_file, list_files (WRITE_SAFE)
+│   │   └── web.py             # http_request (NETWORK)
+│   └── generated/             # Outils créés par l'IA (vide au départ)
+│       └── __init__.py
+├── storage/
+│   └── tools/
+│       ├── registry.json      # Métadonnées des outils
+│       ├── generated/         # Code Python des outils générés
+│       │   └── *.py
+│       └── usage_patterns.json # Apprentissage (Phase 3.5)
+└── api/
+    └── tools.py               # Endpoints CRUD outils
+```
+
+### Format Tool Schema (Standard OpenAI)
+
+**Exemple complet conforme** :
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_current_time",
+    "description": "Get the current time in a specific timezone. Returns ISO 8601 formatted string.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "timezone": {
+          "type": "string",
+          "description": "IANA timezone identifier (e.g., 'Europe/Paris', 'America/New_York')",
+          "enum": null
+        }
+      },
+      "required": []
+    }
+  }
+}
+```
+
+**Métadonnées étendues (stockées séparément)** :
+```json
+{
+  "name": "get_current_time",
+  "permission_level": "read_only",
+  "requires_confirmation": false,
+  "category": "system",
+  "created_by": "system",
+  "version": "1.0.0",
+  "created_at": "2026-03-13T10:00:00Z",
+  "success_count": 42,
+  "failure_count": 1,
+  "last_used": "2026-03-13T15:30:00Z",
+  "average_duration_ms": 12.5,
+  "timeout_seconds": 30
+}
+```
+
+### Intégration Ministral 3
+
+Ministral 3 14B Instruct supporte **nativement** le function calling au format OpenAI.
+
+**Workflow de tool calling** :
+```
+1. USER MESSAGE
+   ↓
+2. TOOL INJECTION
+   - Registry.get_tools_for_ministral() → List[dict] format OpenAI
+   - Injection dans system prompt ou messages
+   ↓
+3. MINISTRAL GÉNÉRATION
+   - Détecte besoin d'un outil
+   - Génère JSON : {"tool_calls": [{"name": "...", "arguments": {...}}]}
+   ↓
+4. PARSING
+   - Extrait JSON de la réponse (peut contenir texte avant/après)
+   - Valide structure tool_calls
+   ↓
+5. EXECUTION
+   - Pour chaque tool call : Registry.execute(name, args)
+   - Timeout, validation, error handling
+   ↓
+6. RESULT INJECTION
+   - Ajoute résultats au contexte
+   - Format : {"role": "tool", "tool_call_id": "...", "content": "..."}
+   ↓
+7. CONTINUATION
+   - Si autres tools nécessaires → retour à 3
+   - Sinon → réponse finale
+   ↓
+8. LIMITE ITERATIONS
+   - Max 5 boucles pour éviter infinite loop
+```
+
+**Format de génération attendu (Ministral)** :
+```json
+{
+  "tool_calls": [
+    {
+      "name": "get_current_time",
+      "arguments": {
+        "timezone": "Europe/Paris"
+      }
+    }
+  ]
+}
+```
+
+**Cas d'erreur à gérer** :
+- JSON malformé → regex fallback, extraction partielle
+- Outil inexistant → error message clair à l'IA
+- Arguments manquants → validation Pydantic, error détaillé
+- Multiples tool calls → exécution séquentielle ou parallèle selon dépendances
+- Timeout dépassé → kill task, retour error
+- Boucle infinie → stop à max_iterations, retour état final
+
+### Phases d'implémentation
+
+#### Phase 3.1 : Foundation (Semaine 1-2) ⭐ PRIORITÉ 1
+
+**Objectif** : Base fonctionnelle avec 3 outils builtin et intégration Ministral
+
+**Sous-phases** :
+- [ ] **3.1.1 : Tool Schema (2-3h)**
+  - Créer `ToolSchema`, `ToolParameter` (Pydantic v2)
+  - Implémenter `to_openai_format()` avec validation stricte
+  - Tests : format exact, validation nom, serialization datetime
+  
+- [ ] **3.1.2 : Tool Registry (4-6h)**
+  - Créer `ToolRegistry` (singleton ou DI)
+  - Thread-safety avec `asyncio.Lock`
+  - Persistence JSON dans `storage/tools/registry.json`
+  - Tests : register/unregister, concurrence, persistence
+  
+- [ ] **3.1.3 : Outils Builtin (3-4h)**
+  - Implémenter `get_current_time`, `get_system_info`, `ping_host`
+  - Auto-registration au startup
+  - Tests : chaque outil, error handling
+  
+- [ ] **3.1.4 : Intégration MinistralEngine (6-8h)**
+  - Modifier `MinistralEngine.stream_with_tools()`
+  - Injection tools dans prompt
+  - Parsing robuste des tool calls
+  - Boucle multi-tools avec max_iterations=5
+  - Tests : simple tool call, multi-tools, erreurs
+  
+- [ ] **3.1.5 : Tests E2E (2-3h)**
+  - Tests avec vrai Ministral (temp=0.15)
+  - Coverage cas d'erreur complets
+  - Performance : overhead < 100ms
+
+**Validation Phase 3.1** :
+- ✅ L'IA peut appeler `get_current_time()` et utiliser le résultat
+- ✅ Format OpenAI strict respecté et validé
+- ✅ Pas de crash sur outil inexistant ou args invalides
+- ✅ Performance acceptable (< 100ms overhead)
+
+#### Phase 3.2 : Sécurité & Validation (Semaine 3)
+
+**Objectif** : Renforcer sécurité et robustesse avant auto-génération
+
+**Sous-phases** :
+- [ ] **3.2.1 : ToolValidator & Security (2-3h)**
+  - AST parsing pour détecter code dangereux
+  - Whitelist/blacklist imports et builtins
+  - Tests : détection eval/exec/subprocess
+  
+- [ ] **3.2.2 : ToolExecutor avec Sandbox (3-4h)**
+  - Timeout configurable par outil
+  - Error handling standardisé
+  - Structured logging de toutes exécutions
+  - Tests : timeout, error recovery
+  
+- [ ] **3.2.3 : Confirmation Flow (2-3h)**
+  - UI/API pour outils `requires_confirmation=True`
+  - Pending state management
+  - Tests : approbation, rejet, expiration
+
+**Validation Phase 3.2** :
+- ✅ Outil avec `eval()` détecté et rejeté
+- ✅ Outil `delete_file` ne s'exécute pas sans confirmation
+- ✅ Tous les logs structurés et queryables
+
+#### Phase 3.3 : API & UI (Semaine 4)
+
+**Objectif** : Interface pour gérer les outils
+
+**Sous-phases** :
+- [ ] **3.3.1 : API REST Tools (3-4h)**
+  - `GET /api/tools` : liste avec métadonnées
+  - `POST /api/tools/execute` : exécution manuelle (test)
+  - `DELETE /api/tools/{name}` : suppression (si created_by != system)
+  
+- [ ] **3.3.2 : UI Swift Tool Calls (4-6h)**
+  - Affichage real-time des tool calls en cours
+  - Indicateur visuel : outil en exécution
+  - Résultats inline dans conversation
+  
+- [ ] **3.3.3 : UI Confirmation (3-4h)**
+  - Dialog pour approuver/rejeter outils destructifs
+  - Preview arguments avant exécution
+  - Timeout auto-rejet après 60s
+
+**Validation Phase 3.3** :
+- ✅ Liste outils visible via API et UI
+- ✅ Tool calls visibles en temps réel dans conversation
+- ✅ Confirmation flow intuitif et sûr
+
+#### Phase 3.4 : Auto-génération (Semaine 5-6) 🚀 AMBITIOUS
+
+**Objectif** : L'IA peut créer ses propres outils
+
+**Sous-phases** :
+- [ ] **3.4.1 : ToolGenerator (4-6h)**
+  - Utilise Ministral pour générer code Python
+  - Prompt engineering pour génération structurée
+  - Tests : génération de outils simples
+  
+- [ ] **3.4.2 : Code Validation (3-4h)**
+  - AST parsing obligatoire
+  - Typage vérification (type hints présents)
+  - Pas d'imports non-whitelisted
+  
+- [ ] **3.4.3 : Review UI (4-6h)**
+  - Interface pour review code généré
+  - Syntax highlighting
+  - Approve/Reject/Edit
+  
+- [ ] **3.4.4 : Hot-reload (2-3h)**
+  - Registry.reload() pour charger nouveaux outils
+  - Pas besoin de redémarrer backend
+
+**Validation Phase 3.4** :
+- ✅ L'IA crée `calculate_mortgage(principal, rate, years)` quand demandé
+- ✅ Code validé par AST avant ajout
+- ✅ Utilisateur peut review et approuver
+
+#### Phase 3.5 : Learning System (Semaine 7-8) 📊 FUTURE
+
+**Objectif** : Apprentissage des patterns d'usage
+
+**Sous-phases** :
+- [ ] **3.5.1 : Usage Pattern Tracker**
+  - Tracking contexte d'utilisation de chaque outil
+  - Stockage patterns dans `usage_patterns.json`
+  
+- [ ] **3.5.2 : Context-aware Suggestions**
+  - Base relationnelle : outil X souvent utilisé après Y
+  - Suggestion proactive d'outils
+  
+- [ ] **3.5.3 : Auto-amélioration Descriptions**
+  - L'IA améliore descriptions si échecs répétés
+  - A/B testing de descriptions
+
+**Validation Phase 3.5** :
+- ✅ L'IA suggère `read_file` automatiquement si mention fichier
+- ✅ Descriptions améliorées basées sur usage réel
+
+### Décisions techniques
+
+| Décision | Justification | Alternative rejetée |
+|----------|---------------|---------------------|
+| **Format OpenAI strict** | Standard industrie, training Ministral | Format custom → modèle confus |
+| **Pydantic v2 pour schemas** | Validation auto, serialization native | Dataclasses → validation manuelle |
+| **asyncio.Lock pour registry** | Protection race conditions | threading.Lock → incompatible asyncio |
+| **JSON storage registry** | Debug facile, versionnable Git | SQLite → overkill, migration complexe |
+| **max_iterations=5** | Empêche boucles infinies | Pas de limite → risque hang |
+| **AST validation seulement** | Balance sécurité/complexité | Vrai sandbox Docker → overkill local |
+| **created_by (system/ai/user)** | Traçabilité, protection système | Pas de distinction → risque suppression |
+| **Timeout 30s default** | Empêche outils bloquants | Pas de timeout → risque hang |
+| **parameters.type = "object"** | Requis par spec OpenAI | Autre type → parsing cassé |
+
+### Risques & Mitigations
+
+| Risque | Probabilité | Impact | Mitigation |
+|--------|-------------|--------|------------|
+| **Hallucination tools** | Haute | Moyen | Parser robuste, validation stricte, fallback gracieux |
+| **Boucle infinie** | Moyenne | Élevé | max_iterations=5, détection patterns cycliques |
+| **Outil destructif** | Faible | Critique | requires_confirmation obligatoire WRITE_MODIFY+ |
+| **Code malveillant généré** | Moyenne | Critique | AST validation, review humaine, whitelist imports |
+| **Performance dégradée** | Moyenne | Moyen | Profiling outils, caching, lazy loading |
+| **Format non-standard** | Faible | Élevé | Validation à chaque to_openai_format(), tests |
+| **Context window overflow** | Moyenne | Moyen | Truncate old messages, summarization |
+
+### Métriques de succès
+
+**Phase 3.1** :
+- [ ] 100% des outils builtin ont tests unitaires
+- [ ] 0 tool call non-validé exécuté
+- [ ] < 100ms overhead total (injection + parsing)
+- [ ] < 5% faux positifs parsing tool calls
+- [ ] Format OpenAI validé à 100%
+
+**Phase 3.2** :
+- [ ] 100% code dangereux détecté par AST
+- [ ] 0 timeout non-géré
+- [ ] 100% confirmations respectées
+
+**Phase 3.3** :
+- [ ] UI tool calls < 200ms latency affichage
+- [ ] 100% confirmations visibles et claires
+
+**Phase 3.4** :
+- [ ] > 80% outils générés valides (passent AST)
+- [ ] < 10% rejets après review humaine
+
+**Phase 3.5** :
+- [ ] > 70% précision suggestions contextuelles
+- [ ] Amélioration descriptions mesurable (success rate)
+
+### Exemples d'usage
+
+**Exemple 1 : Simple tool call**
+```
+User: Quelle heure est-il à Tokyo ?
+Assistant: [THINKING: Je dois utiliser get_current_time]
+           [TOOL_CALL: get_current_time(timezone="Asia/Tokyo")]
+           [TOOL_RESULT: "2026-03-13T18:30:00+09:00"]
+           Il est actuellement 18h30 à Tokyo.
+```
+
+**Exemple 2 : Multi-tools séquentiel**
+```
+User: Lis le fichier rapport.txt et envoie-le par email à john@example.com
+Assistant: [TOOL_CALL: read_file(path="rapport.txt")]
+           [TOOL_RESULT: "Contenu du rapport : ..."]
+           [TOOL_CALL: send_email(to="john@example.com", subject="Rapport", body="...")]
+           [REQUIRES_CONFIRMATION: send_email est un outil NETWORK]
+User: [APPROVE]
+Assistant: Email envoyé avec succès à john@example.com.
+```
+
+**Exemple 3 : Tool hallucination (erreur)**
+```
+User: Quel temps fait-il à Paris ?
+Assistant: [TOOL_CALL: get_weather(city="Paris")]
+           [ERROR: Tool 'get_weather' not found]
+           [FALLBACK]
+           Je n'ai pas accès à un outil météo pour le moment. 
+           Je peux vous donner l'heure actuelle à Paris si vous le souhaitez.
+```
+
+**Exemple 4 : Auto-génération**
+User: Crée un outil pour calculer le TAEG d'un prêt immobilier
+Assistant: [THINKING: Je n'ai pas cet outil, je vais le créer]
+[GENERATING_TOOL: calculate_taeg]
+[CODE_GENERATED]
+python           async def calculate_taeg(
+               principal: float,
+               annual_rate: float,
+               years: int
+           ) -> dict:
+               """Calculate TAEG for a mortgage loan"""
+               monthly_rate = annual_rate / 12 / 100
+               n_payments = years * 12
+               monthly_payment = principal * (
+                   monthly_rate * (1 + monthly_rate)**n_payments
+               ) / ((1 + monthly_rate)**n_payments - 1)
+               return {
+                   "monthly_payment": round(monthly_payment, 2),
+                   "total_paid": round(monthly_payment * n_payments, 2)
+               }
+```
+           [REQUIRES_REVIEW: Nouveau code généré]
+User: [APPROVE]
+Assistant: Outil créé avec succès ! Je peux maintenant calculer le TAEG.
+```
+
+### Références Documentation
+
+**Standards** :
+- OpenAI Function Calling : https://platform.openai.com/docs/guides/function-calling
+- Mistral AI Function Calling : https://docs.mistral.ai/capabilities/function_calling/
+- JSON Schema : https://json-schema.org/understanding-json-schema/
+
+**Frameworks de référence** :
+- LangChain Tools : https://python.langchain.com/docs/modules/tools/
+- LlamaIndex Tools : https://docs.llamaindex.ai/en/stable/module_guides/deploying/agents/tools/
+
+**Sécurité** :
+- Python AST : https://docs.python.org/3/library/ast.html
+- Pydantic Validation : https://docs.pydantic.dev/latest/
+```
+
+---

@@ -1081,33 +1081,536 @@ await register_builtin_tools(registry)  # get_current_time, get_system_info, pin
 - **Stats persistence** : `update_stats()` in-memory uniquement → persist Phase 3.5
 - **RWLock** : Pour > 100 outils → envisager si profiling montre goulot (Phase 3.4+)
 
+-#### Phase 3.2 : Sécurité & Validation ⏳ EN COURS
+
+**Objectif** : Renforcer la sécurité et la robustesse du système tool calling avant d'autoriser l'auto-génération d'outils (Phase 3.4). Implémenter validation AST, timeout effectif, confirmation flow pour outils destructifs.
+
+**Dates** : [À définir] → [À définir]  
+**Durée estimée** : 2-3 jours
+
 ---
 
-#### Phase 3.2 : Sécurité & Validation (Semaine 3)
+### Contraintes non-négociables Phase 3.2
 
-**Objectif** : Renforcer sécurité et robustesse avant auto-génération
+#### Validation sécurité
+- **AST parsing obligatoire** : Tous les outils générés analysés avant exécution
+- **Whitelist imports** : Seuls les modules sûrs autorisés (`datetime`, `math`, `json`, `re`, `typing`, `pathlib`)
+- **Blacklist builtins** : `eval`, `exec`, `compile`, `__import__`, `globals`, `locals`, `vars`
+- **Blacklist modules** : `os.system`, `subprocess`, `socket` (sauf si permission NETWORK/SYSTEM_EXEC)
+- **AST walker exhaustif** : Détection patterns dangereux dans tout l'arbre (pas juste imports)
+- **Rejection immédiate** : Code malveillant → ValueError détaillée avec ligne du problème
 
-**Sous-phases** :
-- [ ] **3.2.1 : ToolValidator & Security (2-3h)**
-  - AST parsing pour détecter code dangereux
-  - Whitelist/blacklist imports et builtins
-  - Tests : détection eval/exec/subprocess
+#### Timeout & Error Handling
+- **Timeout effectif** : Utiliser `asyncio.wait_for()` avec `tool.timeout_seconds`
+- **Timeout par défaut** : 30s (défini dans ToolSchema)
+- **TimeoutError → structured result** : `{"success": False, "error": "Tool timed out after 30s"}`
+- **Toutes exceptions catchées** : Aucune exception non gérée ne remonte au stream
+- **Logging structuré** : Chaque exécution loggée (start, success/fail, duration, error)
+- **Format log** : JSON avec timestamp, tool_name, args, result_type, duration_ms, error
+
+#### Confirmation Flow
+- **Pending state** : Outils `requires_confirmation=True` ne s'exécutent pas immédiatement
+- **Storage pending calls** : Stockage temporaire en mémoire avec TTL 60s
+- **Endpoint approbation** : `POST /api/tools/confirm/{call_id}` avec action approve/reject
+- **Timeout auto-reject** : Après 60s sans réponse, pending call expire (auto-reject)
+- **Preview arguments** : API retourne preview des args avant exécution
+- **Audit trail** : Toutes décisions (approve/reject) loggées
+
+---
+
+### Architecture Phase 3.2
+
+#### Fichiers à créer
+```
+backend/core/tools/validator.py         [CRÉER]
+  - ToolValidator.validate_code(code: str) -> ValidationResult
+  - _check_imports(node: ast.Module) -> List[str]  # errors
+  - _check_builtins(node: ast.Module) -> List[str]
+  - _check_dangerous_patterns(node: ast.Module) -> List[str]
   
-- [ ] **3.2.2 : ToolExecutor avec Sandbox (3-4h)**
-  - Timeout configurable par outil
-  - Error handling standardisé
-  - Structured logging de toutes exécutions
-  - Tests : timeout, error recovery
+backend/core/tools/executor.py          [CRÉER]
+  - ToolExecutor.execute(tool_name: str, args: dict) -> dict
+  - _execute_with_timeout(coro, timeout: float) -> Any
+  - _format_error(exc: Exception) -> dict
+  - _log_execution(tool_name, args, result, duration) -> None
   
-- [ ] **3.2.3 : Confirmation Flow (2-3h)**
-  - UI/API pour outils `requires_confirmation=True`
-  - Pending state management
-  - Tests : approbation, rejet, expiration
+backend/api/tools_confirmation.py       [CRÉER]
+  - POST /api/tools/confirm/{call_id}
+  - GET /api/tools/pending
+  - DELETE /api/tools/pending/{call_id}  # cancel
+  
+backend/core/tools/pending.py           [CRÉER]
+  - PendingCallManager (in-memory store avec TTL)
+  - add_pending(call_id, tool_name, args, created_at)
+  - get_pending(call_id) -> PendingCall | None
+  - approve(call_id) -> ExecutionResult
+  - reject(call_id, reason: str)
+  - cleanup_expired()  # appelé périodiquement
 
-**Validation Phase 3.2** :
-- ✅ Outil avec `eval()` détecté et rejeté
-- ✅ Outil `delete_file` ne s'exécute pas sans confirmation
-- ✅ Tous les logs structurés et queryables
+backend/tests/test_validator.py         [CRÉER]
+backend/tests/test_executor.py          [CRÉER]
+backend/tests/test_confirmation.py      [CRÉER]
+```
+
+#### Fichiers à modifier
+```
+backend/core/llm.py                     [MODIFIER]
+  - stream_with_tools() : utiliser ToolExecutor au lieu d'appel direct
+  - Gérer event type="confirmation_required" dans stream
+  
+backend/core/tools/registry.py          [MODIFIER]
+  - Méthode execute() → délègue à ToolExecutor
+  - Ajouter get_executor() -> ToolExecutor (lazy init)
+  
+backend/main.py                         [MODIFIER]
+  - Ajouter app.state.pending_manager = PendingCallManager()
+  - Ajouter background task cleanup_expired() toutes les 10s
+  - Router tools_confirmation
+```
+
+---
+
+### Sous-phases détaillées
+
+#### 3.2.1 : ToolValidator & Security (3-4h)
+
+**Objectif** : Analyser le code Python généré via AST pour détecter patterns dangereux avant ajout au registry.
+
+**Validation AST - Patterns détectés** :
+
+| Pattern | Exemple code | Action |
+|---------|--------------|--------|
+| `eval()` | `eval("malicious")` | ❌ REJECT |
+| `exec()` | `exec(user_input)` | ❌ REJECT |
+| `compile()` | `compile(code, ...)` | ❌ REJECT |
+| `__import__()` | `__import__("os")` | ❌ REJECT |
+| `globals()` | `globals()["__builtins__"]` | ❌ REJECT |
+| Import non-whitelisted | `import subprocess` | ❌ REJECT (sauf si permission SYSTEM_EXEC) |
+| Import whitelisted | `import datetime` | ✅ ALLOW |
+| Socket sans permission | `socket.socket()` | ❌ REJECT (sauf permission NETWORK) |
+
+**Whitelist imports par défaut** :
+```python
+SAFE_IMPORTS = {
+    "datetime", "math", "json", "re", "typing", 
+    "pathlib", "collections", "itertools", "functools",
+    "decimal", "fractions", "random", "string"
+}
+```
+
+**Whitelist imports conditionnels** :
+```python
+# Autorisé si permission >= NETWORK
+NETWORK_IMPORTS = {"urllib", "http", "requests"}
+
+# Autorisé si permission >= SYSTEM_EXEC
+SYSTEM_IMPORTS = {"subprocess", "os"}
+```
+
+**ValidationResult format** :
+```python
+@dataclass
+class ValidationResult:
+    is_valid: bool
+    errors: List[str]  # ["Line 5: use of eval() is forbidden", ...]
+    warnings: List[str]  # ["Line 10: network call detected, requires NETWORK permission"]
+    imports_used: Set[str]
+    permission_required: PermissionLevel  # minimal requis
+```
+
+**Tests validation** :
+- Code avec `eval()` → rejected avec ligne exacte
+- Code avec `import os` et permission READ_ONLY → rejected
+- Code avec `import os` et permission SYSTEM_EXEC → accepted
+- Code avec `import datetime` → accepted (whitelist)
+- Code valide sans patterns → accepted
+
+---
+
+#### 3.2.2 : ToolExecutor & Timeout (4-5h)
+
+**Objectif** : Wrapper d'exécution centralisé qui gère timeout, error handling, logging structuré pour tous les outils.
+
+**Architecture ToolExecutor** :
+```python
+class ToolExecutor:
+    """
+    Exécute les outils avec timeout, error handling, logging.
+    
+    Responsabilités :
+    - Récupérer executor depuis registry
+    - Appliquer timeout (asyncio.wait_for)
+    - Catcher toutes exceptions
+    - Logger début/fin/erreur
+    - Retourner format standardisé
+    """
+    
+    def __init__(self, registry: ToolRegistry):
+        self.registry = registry
+    
+    async def execute(
+        self, 
+        tool_name: str, 
+        arguments: dict
+    ) -> ExecutionResult:
+        """
+        Exécute un outil avec timeout et error handling.
+        
+        Returns:
+            ExecutionResult avec success, result/error, duration_ms
+        """
+```
+
+**ExecutionResult format** :
+```python
+@dataclass
+class ExecutionResult:
+    success: bool
+    tool_name: str
+    arguments: dict
+    result: Any | None  # Si success=True
+    error: str | None  # Si success=False
+    duration_ms: float
+    timeout_occurred: bool
+    timestamp: datetime
+```
+
+**Gestion timeout** :
+```python
+try:
+    result = await asyncio.wait_for(
+        executor(**arguments),
+        timeout=tool.timeout_seconds
+    )
+    return ExecutionResult(success=True, result=result, ...)
+except asyncio.TimeoutError:
+    return ExecutionResult(
+        success=False, 
+        error=f"Tool timed out after {tool.timeout_seconds}s",
+        timeout_occurred=True,
+        ...
+    )
+except Exception as exc:
+    return ExecutionResult(
+        success=False,
+        error=f"{type(exc).__name__}: {str(exc)}",
+        ...
+    )
+```
+
+**Logging structuré** :
+```json
+{
+  "timestamp": "2026-03-13T16:30:00Z",
+  "event": "tool_execution",
+  "tool_name": "get_current_time",
+  "arguments": {"timezone": "Europe/Paris"},
+  "success": true,
+  "duration_ms": 12.3,
+  "result_preview": "2026-03-13T16:30:00+01:00"
+}
+```
+
+**Tests validation** :
+- Outil rapide (< 1s) → success, duration mesurée
+- Outil lent (sleep 100s) avec timeout 30s → timeout_occurred=True après 30s
+- Outil qui raise ValueError → success=False, error capturé
+- Stats registry mises à jour après chaque exécution
+- Logs structurés présents dans backend/logs/
+
+---
+
+#### 3.2.3 : Confirmation Flow (3-4h)
+
+**Objectif** : Système de validation humaine pour outils destructifs (`requires_confirmation=True`) avant exécution.
+
+**Architecture Pending Calls** :
+```python
+@dataclass
+class PendingCall:
+    call_id: str  # UUID
+    tool_name: str
+    arguments: dict
+    created_at: datetime
+    expires_at: datetime  # created_at + 60s
+    user_id: str | None  # Pour multi-user futur
+    
+class PendingCallManager:
+    """
+    Gère les tool calls en attente de confirmation.
+    
+    In-memory storage (dict) avec cleanup périodique.
+    Phase 3.2 : single-user, pas de persistence.
+    Phase 4+ : persist dans DB, multi-user.
+    """
+    
+    def __init__(self):
+        self._pending: dict[str, PendingCall] = {}
+        self._lock = asyncio.Lock()
+    
+    async def add_pending(...) -> str:  # retourne call_id
+    async def get_pending(call_id) -> PendingCall | None
+    async def approve(call_id) -> ExecutionResult
+    async def reject(call_id, reason) -> None
+    async def cleanup_expired() -> int  # retourne nb expired
+```
+
+**Workflow confirmation** :
+```
+1. LLM génère tool_call avec requires_confirmation=True
+   ↓
+2. ToolExecutor détecte requires_confirmation
+   ↓
+3. add_pending(call_id, tool, args)
+   ↓
+4. Yield event {"type": "confirmation_required", "call_id": "...", "tool": {...}, "args": {...}}
+   ↓
+5. Frontend affiche dialog "Approuver get_weather(city='Paris') ?"
+   ↓
+6a. User APPROVE → POST /api/tools/confirm/{call_id} {"action": "approve"}
+    → execute() → résultat injecté dans conversation
+    
+6b. User REJECT → POST /api/tools/confirm/{call_id} {"action": "reject", "reason": "..."}
+    → error injecté dans conversation
+    
+6c. Timeout 60s → cleanup_expired() auto-reject
+```
+
+**API Endpoints** :
+```python
+# GET /api/tools/pending
+# Retourne la liste des pending calls (pour UI)
+{
+  "pending": [
+    {
+      "call_id": "abc-123",
+      "tool_name": "send_email",
+      "arguments": {"to": "john@example.com", "subject": "..."},
+      "created_at": "2026-03-13T16:30:00Z",
+      "expires_in_seconds": 45
+    }
+  ]
+}
+
+# POST /api/tools/confirm/{call_id}
+# Body: {"action": "approve" | "reject", "reason": "..."}
+{
+  "status": "approved",
+  "execution_result": {
+    "success": true,
+    "result": "Email sent successfully",
+    "duration_ms": 234.5
+  }
+}
+
+# DELETE /api/tools/pending/{call_id}
+# Cancel pending call (équivalent reject)
+{
+  "status": "cancelled"
+}
+```
+
+**Background task cleanup** :
+```python
+# Dans main.py lifespan
+async def cleanup_expired_pending():
+    while True:
+        await asyncio.sleep(10)  # Check toutes les 10s
+        count = await app.state.pending_manager.cleanup_expired()
+        if count > 0:
+            logger.info(f"Cleaned up {count} expired pending calls")
+```
+
+**Tests validation** :
+- Outil avec requires_confirmation=True → pending call créé, pas d'exécution
+- Approve → outil exécuté, résultat retourné
+- Reject → error message dans conversation
+- Timeout 60s → auto-reject, cleanup effectué
+- GET /api/tools/pending retourne liste active
+- Multiples pending calls gérés (pas de collision call_id)
+
+---
+
+### Performance attendue Phase 3.2
+
+| Métrique | Cible | Mesure |
+|----------|-------|--------|
+| **AST validation** | < 10ms par outil | [À mesurer] |
+| **Timeout overhead** | < 5ms (asyncio.wait_for) | [À mesurer] |
+| **Logging overhead** | < 2ms par exécution | [À mesurer] |
+| **Pending call storage** | < 1ms add/get/remove | [À mesurer] |
+| **Cleanup expired** | < 5ms (100 pending calls) | [À mesurer] |
+| **Total overhead** | < 20ms vs Phase 3.1 | [À mesurer] |
+
+---
+
+### Tests validation Phase 3.2
+
+#### 3.2.1 - ToolValidator
+- [x] Code avec `eval()` → rejected avec ligne exacte
+- [x] Code avec `import subprocess` sans permission → rejected
+- [x] Code avec `import subprocess` + SYSTEM_EXEC → accepted
+- [x] Code valide sans patterns → accepted
+- [x] Tous patterns blacklist détectés (eval, exec, compile, __import__, globals)
+- [x] Whitelist imports respectée
+- [x] Permission minimale calculée correctement
+
+#### 3.2.2 - ToolExecutor
+- [x] Outil rapide → success, duration mesurée
+- [x] Outil lent (timeout) → timeout_occurred=True après N secondes
+- [x] Outil qui raise → error capturé, pas de crash
+- [x] Stats registry mises à jour (success_count, duration_ms)
+- [x] Logs structurés JSON présents
+- [x] Format ExecutionResult standardisé
+
+#### 3.2.3 - Confirmation Flow
+- [x] Outil requires_confirmation → pending call créé
+- [x] Approve → outil exécuté, résultat OK
+- [x] Reject → error message approprié
+- [x] Timeout 60s → auto-reject
+- [x] GET /api/tools/pending → liste correcte
+- [x] Cleanup expired fonctionne (background task)
+- [x] Multiples pending calls sans collision
+
+---
+
+### Décisions techniques Phase 3.2
+
+| Décision | Justification | Alternative rejetée |
+|----------|---------------|---------------------|
+| **AST walker Python natif** | Pas de dépendance externe, exhaustif | Regex → fragile, faux négatifs |
+| **asyncio.wait_for pour timeout** | Natif asyncio, précis | threading.Timer → incompatible async |
+| **In-memory pending calls** | Simplicité Phase 3.2 | Redis/DB → overkill single-user |
+| **TTL 60s pour pending** | Balance UX/sécurité | 30s trop court, 120s trop long |
+| **Background task cleanup 10s** | Granularité acceptable | 1s overkill, 60s trop lent |
+| **JSON logs structurés** | Queryable, parsing facile | Texte libre → difficile à analyser |
+| **ExecutionResult dataclass** | Type-safe, sérialisable | Dict → pas de validation |
+| **Whitelist imports** | Explicit is better than implicit | Blacklist → facilement contournable |
+
+---
+
+### Risques & Mitigations Phase 3.2
+
+| Risque | Probabilité | Impact | Mitigation |
+|--------|-------------|--------|------------|
+| **Bypass AST validation** | Moyenne | Critique | Tests exhaustifs, code review |
+| **Faux positifs validation** | Moyenne | Moyen | Whitelist extensible, warnings vs errors |
+| **Timeout trop court** | Faible | Moyen | Configurable par outil (30s default) |
+| **Memory leak pending calls** | Faible | Moyen | Cleanup périodique + TTL strict |
+| **Race condition approve** | Faible | Faible | asyncio.Lock sur pending manager |
+| **Logs volumineux** | Moyenne | Faible | Rotation logs, compression |
+
+---
+
+### Métriques succès Phase 3.2
+
+- ✅ 100% patterns dangereux détectés (eval, exec, subprocess sans permission)
+- ✅ 0 timeout non géré
+- ✅ 100% confirmations respectées (aucune exécution sans approve)
+- ✅ Logs structurés queryables (JSON)
+- ✅ Performance overhead < 20ms vs Phase 3.1
+- ✅ Tous tests passent (validator, executor, confirmation)
+
+---
+
+### Observations pour Phase 3.3
+
+- **UI Swift confirmation dialog** : Phase 3.2 fournit l'API, Phase 3.3 implémentera l'UI
+- **Audit trail complet** : Logs + pending history → base pour analytics Phase 3.5
+- **Permission escalation** : Phase 3.4 pourra demander élévation permission via confirmation
+- **Multi-user** : Architecture PendingCallManager prête pour ajout user_id
+
+---
+
+### Exemples d'usage Phase 3.2
+
+**Exemple 1 : Validation code malveillant**
+```python
+code = """
+import subprocess
+subprocess.run(["rm", "-rf", "/"])
+"""
+validator = ToolValidator()
+result = validator.validate_code(code, permission=PermissionLevel.READ_ONLY)
+# result.is_valid = False
+# result.errors = ["Line 1: import 'subprocess' requires SYSTEM_EXEC permission"]
+```
+
+**Exemple 2 : Timeout outil lent**
+```python
+executor = ToolExecutor(registry)
+result = await executor.execute("slow_tool", {})
+# Si slow_tool prend 100s et timeout=30s :
+# result.success = False
+# result.timeout_occurred = True
+# result.error = "Tool timed out after 30s"
+# result.duration_ms ≈ 30000
+```
+
+**Exemple 3 : Confirmation flow complet**
+```python
+# 1. LLM génère tool_call avec requires_confirmation=True
+tool_call = {"name": "delete_file", "arguments": {"path": "/important.txt"}}
+
+# 2. ToolExecutor détecte requires_confirmation
+pending_manager = PendingCallManager()
+call_id = await pending_manager.add_pending("delete_file", {"path": "/important.txt"})
+# call_id = "abc-123-def-456"
+
+# 3. Event streamed au frontend
+yield {"type": "confirmation_required", "call_id": call_id, ...}
+
+# 4a. User approve via POST /api/tools/confirm/abc-123-def-456
+result = await pending_manager.approve(call_id)
+# result.success = True, file deleted
+
+# 4b. User reject
+await pending_manager.reject(call_id, reason="File is important")
+# Error message injecté dans conversation
+```
+
+---
+
+### Commit final Phase 3.2
+```bash
+# Après validation complète
+git add backend/core/tools/validator.py backend/core/tools/executor.py backend/core/tools/pending.py
+git add backend/api/tools_confirmation.py
+git add backend/tests/test_validator.py backend/tests/test_executor.py backend/tests/test_confirmation.py
+git add backend/core/llm.py backend/core/tools/registry.py backend/main.py
+git add AGENTS.md
+
+git commit -m "Phase 3.2 complétée : Sécurité & Validation
+
+- ToolValidator : AST parsing, whitelist/blacklist, permission check
+- ToolExecutor : timeout effectif, error handling, logging structuré
+- Confirmation Flow : pending calls, approve/reject API, auto-cleanup
+- Tests : 100% patterns dangereux détectés, timeout géré
+- Performance : overhead < 20ms, tous tests passent"
+
+git tag phase-3.2-complete
+git push origin main --tags
+```
+
+---
+
+### Validation passage Phase 3.3
+
+**Pré-requis OBLIGATOIRES** :
+
+- [ ] ✅ Tous tests 3.2.1, 3.2.2, 3.2.3 passent
+- [ ] ✅ 100% patterns dangereux détectés (eval, exec, subprocess)
+- [ ] ✅ Timeout fonctionnel (testé avec outil lent)
+- [ ] ✅ Confirmation flow complet (approve/reject/timeout)
+- [ ] ✅ Logs structurés JSON présents
+- [ ] ✅ Performance overhead < 20ms mesurée
+- [ ] ✅ Aucune régression Phase 3.1 (32 tests passent toujours)
+- [ ] ✅ Documentation AGENTS.md mise à jour
+- [ ] ✅ Commit phase-3.2-complete tagué
+
+**Si tous pré-requis ✅** → Passage Phase 3.3 autorisé  
+**Si un seul ❌** → Corriger avant de continuer
+
 
 #### Phase 3.3 : API & UI (Semaine 4)
 

@@ -22,10 +22,12 @@ Reconstruction des executors :
     startup avec register(…, force=True) pour réinjecter leurs callables.
 
 Path :
-    Paramètre constructeur avec défaut calculé depuis __file__.
-    Pattern identique à JSONManager — DI explicite, refactoring-safe.
-    __file__ = backend/core/tools/registry.py
-    parents[2] = backend/  →  défaut : backend/storage/tools/
+    Paramètre constructeur avec injection explicite possible.
+    Sans paramètre, le path est résolu ainsi :
+      1) TOOLS_FOLDER (si défini)
+      2) DATA_FOLDER/tools_registry (ou sibling si DATA_FOLDER finit par
+         ".../conversations")
+      3) fallback legacy : backend/storage/tools/
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -41,8 +44,32 @@ from .schema import PermissionLevel, ToolSchema
 
 logger = logging.getLogger(__name__)
 
-# Défaut calculé à l'import depuis __file__ — ne dépend pas du cwd
-_DEFAULT_STORAGE = Path(__file__).parents[2] / "storage" / "tools"
+# Fallback legacy dans le repo (utilisé seulement si aucune config externe).
+_LEGACY_STORAGE = Path(__file__).parents[2] / "storage" / "tools"
+
+
+def _resolve_default_storage() -> Path:
+    """
+    Résout le dossier de persistance des outils.
+
+    Priorité :
+      1) TOOLS_FOLDER explicite
+      2) dérivé de DATA_FOLDER (même volume SSD externe)
+      3) fallback legacy dans le repo
+    """
+    tools_folder = os.getenv("TOOLS_FOLDER", "").strip()
+    if tools_folder:
+        return Path(tools_folder)
+
+    data_folder = os.getenv("DATA_FOLDER", "").strip()
+    if data_folder:
+        data_path = Path(data_folder)
+        # Cas courant : DATA_FOLDER=/Volumes/AISSD/conversations
+        if data_path.name.lower() == "conversations":
+            return data_path.parent / "tools_registry"
+        return data_path / "tools_registry"
+
+    return _LEGACY_STORAGE
 
 # Ordre strict des niveaux (READ_ONLY = moins permissif, AUTONOMOUS = plus permissif)
 _PERMISSION_ORDER: list[PermissionLevel] = [
@@ -94,7 +121,7 @@ class ToolRegistry:
     _instance: "ToolRegistry | None" = None
 
     def __init__(self, storage_path: Path | None = None) -> None:
-        self._storage_path = Path(storage_path) if storage_path else _DEFAULT_STORAGE
+        self._storage_path = Path(storage_path) if storage_path else _resolve_default_storage()
         self._registry_file = self._storage_path / "registry.json"
 
         # Schémas (persistés sur disk)

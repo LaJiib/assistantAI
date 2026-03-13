@@ -39,6 +39,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", "")
 HOST       = os.getenv("HOST", "127.0.0.1")
 PORT       = int(os.getenv("PORT", "8000"))
 DATA_FOLDER = os.getenv("DATA_FOLDER", "").strip()
+TOOLS_FOLDER = os.getenv("TOOLS_FOLDER", "").strip()
 MAX_GENERATION_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "512"))
 if MAX_GENERATION_TOKENS <= 0:
     logger.warning("MAX_GENERATION_TOKENS invalide (%s), fallback à 512", MAX_GENERATION_TOKENS)
@@ -50,6 +51,24 @@ if MAX_GENERATION_TEMPERATURE < 0.0 or MAX_GENERATION_TEMPERATURE > 2.0:
         MAX_GENERATION_TEMPERATURE,
     )
     MAX_GENERATION_TEMPERATURE = 0.3
+
+
+def _resolve_tools_folder() -> Path:
+    """
+    Dossier de persistance des outils.
+
+    Priorité :
+      1) TOOLS_FOLDER explicite
+      2) sibling de DATA_FOLDER (si DATA_FOLDER se termine par /conversations)
+      3) DATA_FOLDER/tools_registry
+    """
+    if TOOLS_FOLDER:
+        return Path(TOOLS_FOLDER)
+
+    data_path = Path(DATA_FOLDER)
+    if data_path.name.lower() == "conversations":
+        return data_path.parent / "tools_registry"
+    return data_path / "tools_registry"
 
 
 
@@ -85,7 +104,8 @@ async def lifespan(app: FastAPI):
     app.state.json_manager = jm
     jm.verify_integrity()
 
-    registry = ToolRegistry.get_instance()
+    tools_folder = _resolve_tools_folder()
+    registry = ToolRegistry.get_instance(storage_path=tools_folder)
     await register_builtin_tools(registry)
     app.state.tool_registry = registry
 
@@ -117,6 +137,7 @@ async def lifespan(app: FastAPI):
         app.state.model_task = asyncio.create_task(_load_model())
 
     logger.info(f"📡 Écoute sur http://{HOST}:{PORT}")
+    logger.info("🧰 tools_registry=%s", tools_folder)
     logger.info("⚙️ max_generation_tokens=%d", MAX_GENERATION_TOKENS)
     logger.info("⚙️ max_generation_temperature=%.2f", MAX_GENERATION_TEMPERATURE)
 

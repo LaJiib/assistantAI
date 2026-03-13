@@ -829,10 +829,10 @@ backend/
 │   │   └── web.py             # http_request (NETWORK)
 │   └── generated/             # Outils créés par l'IA (vide au départ)
 │       └── __init__.py
-├── storage/
-│   └── tools/
-│       ├── registry.json      # Métadonnées des outils
-│       ├── generated/         # Code Python des outils générés
+├── (persistence externe via DATA_FOLDER / TOOLS_FOLDER)
+│   └── tools_registry/
+│       ├── registry.json       # Métadonnées des outils
+│       ├── generated/          # Code Python des outils générés
 │       │   └── *.py
 │       └── usage_patterns.json # Apprentissage (Phase 3.5)
 └── api/
@@ -976,7 +976,7 @@ Ministral 3 14B Instruct supporte **nativement** le function calling au format O
 | `backend/tools/builtin/__init__.py` | 68 | register_builtin_tools(registry) — appelé au lifespan |
 | `backend/tools/builtin/system.py` | 306 | get_current_time, get_system_info, ping_host + BUILTIN_TOOLS dict |
 | `backend/tests/test_tool_calling_e2e.py` | ~430 | 32 tests (3.1.1→perf) + 3 tests E2E avec vrai modèle |
-| `backend/storage/tools/` | — | Dossier créé ; registry.json auto-généré |
+| `TOOLS_FOLDER` (ou `DATA_FOLDER/tools_registry`) | — | Dossier externe ; `registry.json` auto-généré |
 
 #### Fichiers modifiés
 
@@ -1191,7 +1191,7 @@ await register_builtin_tools(registry)  # get_current_time, get_system_info, pin
 | **Format OpenAI strict** | Standard industrie, training Ministral | Format custom → modèle confus |
 | **Pydantic v2 pour schemas** | Validation auto, serialization native | Dataclasses → validation manuelle |
 | **asyncio.Lock pour registry** | Protection race conditions | threading.Lock → incompatible asyncio |
-| **JSON storage registry** | Debug facile, versionnable Git | SQLite → overkill, migration complexe |
+| **JSON storage registry (externe)** | Debug facile, full-local hors repo | SQLite → overkill, migration complexe |
 | **max_iterations=5** | Empêche boucles infinies | Pas de limite → risque hang |
 | **AST validation seulement** | Balance sécurité/complexité | Vrai sandbox Docker → overkill local |
 | **created_by (system/ai/user)** | Traçabilité, protection système | Pas de distinction → risque suppression |

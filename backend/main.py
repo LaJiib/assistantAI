@@ -20,9 +20,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.llm import MinistralEngine
+from core.tools import ToolRegistry
 from api.conversations import router as conversations_router
 from api.messages import router as messages_router
 from storage.json_manager import JSONManager
+from tools import register_builtin_tools
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +84,10 @@ async def lifespan(app: FastAPI):
     jm = JSONManager(Path(DATA_FOLDER))
     app.state.json_manager = jm
     jm.verify_integrity()
+
+    registry = ToolRegistry.get_instance()
+    await register_builtin_tools(registry)
+    app.state.tool_registry = registry
 
     app.state.engine = None
     app.state.model_loading = False

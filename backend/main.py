@@ -1,15 +1,14 @@
 """
-AssistantIA — Backend FastAPI
-GET /health  |  POST /chat  |  POST /chat/stream
+Iris — Backend FastAPI
+GET /health  |  POST /chat  |  POST /chat/stream  |  POST /agent/chat
 
 Démarrage : python main.py
 """
 
+import asyncio
 import json
 import logging
 import os
-import sys
-import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
 
@@ -19,7 +18,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from core.llm import MinistralEngine
+from core.llm import IrisEngine
+from core.agent import IrisDeps, create_iris_agent
 from core.tools import ToolRegistry
 from api.conversations import router as conversations_router
 from api.messages import router as messages_router
@@ -71,7 +71,6 @@ def _resolve_tools_folder() -> Path:
     return data_path / "tools_registry"
 
 
-
 # ── Schémas ───────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -81,6 +80,16 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+
+class AgentChatRequest(BaseModel):
+    """Requête pour l'endpoint agent — utilise IrisAgent (Pydantic AI)."""
+    message:     str   = Field(..., min_length=1, description="Message utilisateur")
+    max_tokens:  int   = Field(MAX_GENERATION_TOKENS, gt=0, le=32768)
+    temperature: float = Field(MAX_GENERATION_TEMPERATURE, ge=0.0, le=2.0)
+
+class AgentChatResponse(BaseModel):
+    response: str
+    model:    str
 
 class HealthResponse(BaseModel):
     status:       str
@@ -94,7 +103,7 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    logger.info("🚀 Démarrage AssistantIA backend…")
+    logger.info("🌸 Démarrage Iris backend…")
 
     if not DATA_FOLDER:
         logger.error("❌ DATA_FOLDER non défini (vérifiez .env)")
@@ -110,6 +119,7 @@ async def lifespan(app: FastAPI):
     app.state.tool_registry = registry
 
     app.state.engine = None
+    app.state.iris_agent = None
     app.state.model_loading = False
     app.state.model_error = None
     app.state.model_task = None
@@ -124,10 +134,12 @@ async def lifespan(app: FastAPI):
 
         async def _load_model():
             try:
-                engine = MinistralEngine(model_path=MODEL_PATH)
+                engine = IrisEngine(model_path=MODEL_PATH)
                 await engine.load()
                 app.state.engine = engine
-                logger.info("✅ Modèle chargé : %s", engine.model_name)
+                # Créer l'agent Pydantic AI une fois le moteur chargé
+                app.state.iris_agent = create_iris_agent(engine)
+                logger.info("✅ Iris prête : %s", engine.model_name)
             except Exception as exc:
                 app.state.model_error = str(exc)
                 logger.exception("❌ Échec chargement modèle")
@@ -136,10 +148,9 @@ async def lifespan(app: FastAPI):
 
         app.state.model_task = asyncio.create_task(_load_model())
 
-    logger.info(f"📡 Écoute sur http://{HOST}:{PORT}")
+    logger.info("📡 Écoute sur http://%s:%d", HOST, PORT)
     logger.info("🧰 tools_registry=%s", tools_folder)
-    logger.info("⚙️ max_generation_tokens=%d", MAX_GENERATION_TOKENS)
-    logger.info("⚙️ max_generation_temperature=%.2f", MAX_GENERATION_TEMPERATURE)
+    logger.info("⚙️  max_tokens=%d  temperature=%.2f", MAX_GENERATION_TOKENS, MAX_GENERATION_TEMPERATURE)
 
     try:
         yield
@@ -158,20 +169,20 @@ async def lifespan(app: FastAPI):
             pass
 
 
-
 app = FastAPI(
-    title="AssistantIA Backend",
-    version="0.1.0",
+    title="Iris — Assistant Consulting Backend",
+    version="2.0.0",
     lifespan=lifespan,
 )
 app.include_router(conversations_router)
 app.include_router(messages_router)
 
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    engine: MinistralEngine | None = getattr(app.state, "engine", None)
+    engine: IrisEngine | None = getattr(app.state, "engine", None)
     loaded = engine is not None and engine.is_loaded
     return HealthResponse(
         status="ok" if loaded else "degraded",
@@ -183,8 +194,8 @@ async def health() -> HealthResponse:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    """Génère une réponse complète (non-streaming)."""
-    engine: MinistralEngine | None = getattr(app.state, "engine", None)
+    """Génère une réponse complète (non-streaming) depuis un prompt brut."""
+    engine: IrisEngine | None = getattr(app.state, "engine", None)
     max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
     max_generation_temperature: float = float(
         getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE)
@@ -206,17 +217,17 @@ def chat(request: ChatRequest) -> ChatResponse:
 @app.post("/chat/stream")
 def chat_stream(request: ChatRequest) -> StreamingResponse:
     """
-    Génère une réponse en streaming (Server-Sent Events).
+    Génère une réponse en streaming (Server-Sent Events) depuis un prompt brut.
 
     Format SSE :
-        data: {"text": "chunk"}\n\n   (un chunk par token ou groupe)
-        data: [DONE]\n\n              (fin de génération)
+        data: {"text": "chunk"}\\n\\n   (un chunk par token ou groupe)
+        data: [DONE]\\n\\n              (fin de génération)
 
     Erreur mid-stream :
-        data: {"error": "message"}\n\n
-        data: [DONE]\n\n
+        data: {"error": "message"}\\n\\n
+        data: [DONE]\\n\\n
     """
-    engine: MinistralEngine | None = getattr(app.state, "engine", None)
+    engine: IrisEngine | None = getattr(app.state, "engine", None)
     max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
     max_generation_temperature: float = float(
         getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE)
@@ -240,6 +251,44 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse(), media_type="text/event-stream")
+
+
+@app.post("/agent/chat", response_model=AgentChatResponse)
+async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
+    """
+    Génère une réponse via l'agent Iris (Pydantic AI + tool calling).
+
+    Différence avec /chat :
+      - Utilise IrisAgent (Pydantic AI) → supporte le tool calling multi-tours.
+      - Injecte IrisDeps (sera enrichi avec LanceDB en Étape 2).
+      - Résultat final après toutes les itérations de l'agent loop.
+
+    Usage recommandé pour les requêtes nécessitant des outils ou un raisonnement
+    multi-étapes. Pour un chat simple, /chat/stream est plus rapide.
+    """
+    iris_agent = getattr(app.state, "iris_agent", None)
+    engine: IrisEngine | None = getattr(app.state, "engine", None)
+
+    if not iris_agent or not engine or not engine.is_loaded:
+        raise HTTPException(status_code=503, detail="Agent Iris non initialisé.")
+
+    try:
+        from pydantic_ai.settings import ModelSettings
+        settings = ModelSettings(
+            max_tokens=min(request.max_tokens, int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))),
+            temperature=min(request.temperature, float(getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE))),
+        )
+        result = await iris_agent.run(
+            request.message,
+            deps=IrisDeps(),   # Étape 2 : injecter VectorStoreManager ici
+            model_settings=settings,
+        )
+        return AgentChatResponse(
+            response=result.data,
+            model=engine.model_name,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────

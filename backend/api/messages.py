@@ -71,7 +71,7 @@ def get_json_manager(request: Request) -> JSONManager:
 
 
 def get_engine(request: Request):
-    """Injecte MinistralEngine ou lève 503 si non chargé."""
+    """Injecte IrisEngine ou lève 503 si non chargé."""
     engine = getattr(request.app.state, "engine", None)
     if engine is None or not engine.is_loaded:
         raise HTTPException(

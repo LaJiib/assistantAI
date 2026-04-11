@@ -175,13 +175,20 @@ final class ChatAPI {
             return .httpError(urlError.errorCode, urlError.localizedDescription)
         }
     }
-    func streamAgentChat(prompt: String) -> AsyncThrowingStream<String, Error> {
+    /// Streaming SSE Agent Iris : POST /agent/chat/stream → yield les chunks token par token.
+    ///
+    /// Le frontend envoie uniquement le message brut via le champ `message`.
+    /// Le system prompt Iris est injecté exclusivement côté backend (core/agent.py).
+    func streamAgentMessage(
+        _ message: String,
+        maxTokens: Int? = nil,
+        temperature: Float? = nil
+    ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    // On pointe vers le nouvel endpoint de l'Agent Iris
-                    var request = self.makeRequest(path: "/agent/chat")
-                    let body = ["prompt": prompt]
+                    var request = self.makeRequest(path: "/agent/chat/stream")
+                    let body = AgentChatRequest(message: message, max_tokens: maxTokens, temperature: temperature)
                     request.httpBody = try JSONEncoder().encode(body)
 
                     let (bytes, response) = try await self.session.bytes(for: request)
@@ -192,12 +199,48 @@ final class ChatAPI {
                         self.handleSSELine(line, continuation: continuation)
                     }
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish(throwing: ChatAPIError.cancelled)
+                } catch let err as ChatAPIError {
+                    continuation.finish(throwing: err)
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: self.classify(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Agent Iris : POST /agent/chat → retourne la réponse complète (tool calling inclus).
+    /// Utilise le champ `message` aligné sur AgentChatRequest côté Python.
+    func sendAgentMessage(
+        _ message: String,
+        maxTokens: Int? = nil,
+        temperature: Float? = nil
+    ) async throws -> String {
+        var request = makeRequest(path: "/agent/chat")
+        let body = AgentChatRequest(message: message, max_tokens: maxTokens, temperature: temperature)
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await session.data(for: request)
+        try validateHTTPResponse(response, data: data)
+
+        let decoded = try JSONDecoder().decode(AgentChatResponse.self, from: data)
+        return decoded.response
+    }
+
+    /// Génération de titre : POST /agent/title → titre court ≤ 10 mots.
+    /// Le frontend envoie uniquement le texte brut ; le prompt engineering est côté backend.
+    func generateTitle(for message: String) async throws -> String {
+        var request = makeRequest(path: "/agent/title")
+        let body = TitleRequest(message: message)
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await session.data(for: request)
+        try validateHTTPResponse(response, data: data)
+
+        let decoded = try JSONDecoder().decode(TitleResponse.self, from: data)
+        return decoded.title
     }
 }
 
@@ -211,6 +254,26 @@ private struct ChatRequest: Encodable {
 
 private struct ChatResponse: Decodable {
     let response: String
+}
+
+/// Aligné sur AgentChatRequest (Python) : champ `message`.
+private struct AgentChatRequest: Encodable {
+    let message: String
+    let max_tokens: Int?
+    let temperature: Float?
+}
+
+private struct AgentChatResponse: Decodable {
+    let response: String
+    let model: String
+}
+
+private struct TitleRequest: Encodable {
+    let message: String
+}
+
+private struct TitleResponse: Decodable {
+    let title: String
 }
 
 /// Chunk SSE : {"text": "..."} ou {"error": "..."}

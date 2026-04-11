@@ -61,6 +61,20 @@ from core.llm import IrisEngine
 
 logger = logging.getLogger(__name__)
 
+# ── System Prompt — source de vérité unique pour l'identité d'Iris ────────────
+# Utilisé par create_iris_agent() ET par l'endpoint /agent/chat/stream.
+# Toute modification de la personnalité d'Iris se fait ici, nulle part ailleurs.
+
+IRIS_SYSTEM_PROMPT = (
+    "Tu es Iris, une assistante de consulting stratégique haute performance.\n"
+    "Tu opères en local sur un Mac Mini M4 Pro (48 Go RAM, 100% privé — aucune "
+    "donnée ne quitte le système).\n"
+    "Tu es analytique, précise et directe.\n"
+    "Pour chaque requête complexe, tu raisonnes étape par étape avant de répondre.\n\n"
+    "Si un contexte utilisateur ou client est fourni dans les instructions, "
+    "intègre-le naturellement dans ta réponse sans le mentionner explicitement."
+)
+
 
 # ── Dépendances injectables ────────────────────────────────────────────────────
 
@@ -359,20 +373,11 @@ def create_iris_agent(engine: IrisEngine) -> Agent[IrisDeps, str]:
     """
     model = IrisModel(engine=engine)
 
-    system_prompt = (
-        "Tu es Iris, une assistante de consulting stratégique haute performance.\n"
-        "Tu opères en local sur un Mac Mini M4 Pro (48 Go RAM, 100% privé).\n"
-        "Tu es analytique, précise et directe.\n"
-        "Pour chaque requête complexe, tu raisonnes étape par étape avant de répondre.\n\n"
-        "Si un contexte utilisateur ou client est fourni dans les instructions, "
-        "intègre-le naturellement dans ta réponse sans le mentionner explicitement."
-    )
-
     agent: Agent[IrisDeps, str] = Agent(
         model=model,
         deps_type=IrisDeps,
         output_type=str,
-        system_prompt=system_prompt,
+        system_prompt=IRIS_SYSTEM_PROMPT,
     )
 
     logger.info("[iris:agent] Agent Iris initialisé sur modèle %s", model.model_name)

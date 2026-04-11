@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.llm import IrisEngine
-from core.agent import IrisDeps, create_iris_agent
+from core.agent import IrisDeps, create_iris_agent, IRIS_SYSTEM_PROMPT
 from core.tools import ToolRegistry
 from api.conversations import router as conversations_router
 from api.messages import router as messages_router
@@ -90,6 +90,13 @@ class AgentChatRequest(BaseModel):
 class AgentChatResponse(BaseModel):
     response: str
     model:    str
+
+class TitleRequest(BaseModel):
+    """Requête pour la génération de titre — le frontend envoie le texte brut."""
+    message: str = Field(..., min_length=1)
+
+class TitleResponse(BaseModel):
+    title: str
 
 class HealthResponse(BaseModel):
     status:       str
@@ -287,6 +294,80 @@ async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
             response=result.data,
             model=engine.model_name,
         )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/agent/chat/stream")
+def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
+    """
+    Streaming SSE de l'Agent Iris — même identité qu'avec /agent/chat.
+
+    Utilise engine.stream_messages() directement avec IRIS_SYSTEM_PROMPT injecté
+    en tête du contexte : le frontend envoie uniquement le message brut, toute la
+    personnalité et les instructions d'Iris restent côté backend.
+
+    Format SSE identique à /chat/stream :
+        data: {"text": "chunk"}\\n\\n
+        data: [DONE]\\n\\n
+    """
+    engine: IrisEngine | None = getattr(app.state, "engine", None)
+    max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
+    max_generation_temperature: float = float(
+        getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE)
+    )
+    if not engine or not engine.is_loaded:
+        raise HTTPException(status_code=503, detail="Modèle non chargé.")
+
+    effective_max_tokens  = min(request.max_tokens,  max_generation_tokens)
+    effective_temperature = min(request.temperature, max_generation_temperature)
+
+    messages = [
+        {"role": "system", "content": IRIS_SYSTEM_PROMPT},
+        {"role": "user",   "content": request.message},
+    ]
+
+    def sse():
+        try:
+            for chunk in engine.stream_messages(
+                messages,
+                max_tokens=effective_max_tokens,
+                temperature=effective_temperature,
+            ):
+                yield f"data: {json.dumps({'text': chunk})}\n\n"
+        except RuntimeError as exc:
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
+
+
+@app.post("/agent/title", response_model=TitleResponse)
+def agent_title(request: TitleRequest) -> TitleResponse:
+    """
+    Génère un titre court (≤ 10 mots) pour une conversation.
+
+    Le frontend envoie uniquement le texte brut du premier message utilisateur.
+    Tout le prompt engineering (instruction de titrage) est centralisé ici.
+    """
+    engine: IrisEngine | None = getattr(app.state, "engine", None)
+    if not engine or not engine.is_loaded:
+        raise HTTPException(status_code=503, detail="Modèle non chargé.")
+
+    _TITLE_SYSTEM = (
+        "Your only task is to generate a very short title (max 10 words) "
+        "that summarizes the user's request. "
+        "Respond with only the title, no punctuation around it, nothing else."
+    )
+    messages = [
+        {"role": "system", "content": _TITLE_SYSTEM},
+        {"role": "user",   "content": request.message},
+    ]
+    try:
+        raw = engine._generate_raw(messages, None, 30, 0.1)
+        title = raw.strip().strip("\"'")
+        return TitleResponse(title=title or "Nouvelle conversation")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

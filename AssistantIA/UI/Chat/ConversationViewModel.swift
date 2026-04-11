@@ -58,13 +58,12 @@ class ConversationViewModel {
 
     // MARK: - Generate
 
-    /// Envoie le prompt courant au backend et stream la réponse.
+    /// Envoie le texte brut au backend (Agent Iris) et affiche la réponse.
     ///
     /// Flux :
     ///   1. Append user message localement (UI immédiate)
-    ///   2. `conversationAPI.sendMessage()` → backend sauvegarde user + génère assistant
-    ///   3. Chunks SSE appended localement au fur et à mesure
-    ///   4. Backend sauvegarde l'assistant complet (ou partiel si cancel) dans `finally`
+    ///   2. POST /agent/chat — backend orchestre l'agent loop (tool calling inclus)
+    ///   3. Réponse finale appended en une fois (l'agent n'est pas streamable)
     func generate() async {
         if let existingTask = generateTask {
             existingTask.cancel()
@@ -79,8 +78,7 @@ class ConversationViewModel {
         clear(.prompt)
 
         generateTask = Task {
-            // Appel direct au nouvel endpoint Agent
-            for try await chunk in ChatAPI.shared.streamAgentChat(prompt: userContent) {
+            for try await chunk in ChatAPI.shared.streamAgentMessage(userContent) {
                 if let lastIndex = messages.indices.last,
                    messages[lastIndex].role == .assistant {
                     messages[lastIndex].content += chunk
@@ -96,7 +94,6 @@ class ConversationViewModel {
             } onCancel: {
                 Task { @MainActor in
                     self.generateTask?.cancel()
-                    // Message partiel conservé — cohérent avec ce que le backend a sauvegardé
                     if let lastIndex = self.messages.indices.last,
                        self.messages[lastIndex].role == .assistant {
                         self.messages[lastIndex].content += "\n[Annulé]"
@@ -104,11 +101,9 @@ class ConversationViewModel {
                 }
             }
         } catch is CancellationError {
-            // Annulation volontaire — message [Annulé] déjà ajouté dans onCancel
+            // Annulation volontaire
         } catch {
             errorMessage = error.localizedDescription
-            // Message user conservé localement même si erreur réseau :
-            // on ne sait pas si le backend l'a reçu ou non.
         }
 
         await generateTitleWithAI()
@@ -118,37 +113,18 @@ class ConversationViewModel {
 
     // MARK: - Title Generation
 
-    /// Génère un titre court au 1er échange (system + user + assistant = 3 messages).
+    /// Génère un titre court au 1er échange via POST /agent/title.
     ///
-    /// Utilise ChatAPI (endpoint /chat stateless) pour ne pas polluer l'historique.
-    /// Met à jour le titre côté backend + notifie le Manager pour son cache local.
+    /// Le frontend envoie uniquement le texte brut ; le backend gère le prompt engineering.
     private func generateTitleWithAI() async {
         guard messages.count == 3, !titleGenerated else { return }
         let firstUserMessage = messages.first(where: { $0.role == .user })?.content ?? ""
         guard !firstUserMessage.isEmpty else { return }
 
-        let titlePrompt = """
-        System: Your only task is to generate a very short title (max 10 words) \
-        that summarizes the user's request. Respond with only the title, nothing else.
-
-        User: \(firstUserMessage)
-        """
-
         do {
-            let rawTitle = try await ChatAPI.shared.sendMessage(
-                titlePrompt,
-                maxTokens: 30,
-                temperature: 0.1
-            )
-            let cleanedTitle = rawTitle
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            guard !cleanedTitle.isEmpty else { return }
-
-            // Persistance backend
-            try? await conversationAPI.updateConversation(id: conversation.id, title: cleanedTitle)
-            // Cache Manager
-            onTitleGenerated?(cleanedTitle)
+            let title = try await ChatAPI.shared.generateTitle(for: firstUserMessage)
+            try? await conversationAPI.updateConversation(id: conversation.id, title: title)
+            onTitleGenerated?(title)
             titleGenerated = true
         } catch {
             print("[ConversationViewModel] ⚠️ Titre: \(error)")

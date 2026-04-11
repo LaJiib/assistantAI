@@ -198,68 +198,6 @@ async def health() -> HealthResponse:
         pid=os.getpid(),
     )
 
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-    """Génère une réponse complète (non-streaming) depuis un prompt brut."""
-    engine: IrisEngine | None = getattr(app.state, "engine", None)
-    max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
-    max_generation_temperature: float = float(
-        getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE)
-    )
-    effective_max_tokens = min(request.max_tokens, max_generation_tokens)
-    effective_temperature = min(request.temperature, max_generation_temperature)
-    if not engine or not engine.is_loaded:
-        raise HTTPException(status_code=503, detail="Modèle non chargé.")
-    try:
-        return ChatResponse(response=engine.generate(
-            prompt=request.prompt,
-            max_tokens=effective_max_tokens,
-            temperature=effective_temperature,
-        ))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/chat/stream")
-def chat_stream(request: ChatRequest) -> StreamingResponse:
-    """
-    Génère une réponse en streaming (Server-Sent Events) depuis un prompt brut.
-
-    Format SSE :
-        data: {"text": "chunk"}\\n\\n   (un chunk par token ou groupe)
-        data: [DONE]\\n\\n              (fin de génération)
-
-    Erreur mid-stream :
-        data: {"error": "message"}\\n\\n
-        data: [DONE]\\n\\n
-    """
-    engine: IrisEngine | None = getattr(app.state, "engine", None)
-    max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
-    max_generation_temperature: float = float(
-        getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE)
-    )
-    effective_max_tokens = min(request.max_tokens, max_generation_tokens)
-    effective_temperature = min(request.temperature, max_generation_temperature)
-    if not engine or not engine.is_loaded:
-        raise HTTPException(status_code=503, detail="Modèle non chargé.")
-
-    def sse():
-        try:
-            for chunk in engine.stream(
-                prompt=request.prompt,
-                max_tokens=effective_max_tokens,
-                temperature=effective_temperature,
-            ):
-                yield f"data: {json.dumps({'text': chunk})}\n\n"
-        except RuntimeError as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-        finally:
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(sse(), media_type="text/event-stream")
-
-
 @app.post("/agent/chat", response_model=AgentChatResponse)
 async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
     """

@@ -57,7 +57,7 @@ async def register_builtin_tools(registry: ToolRegistry) -> None:
         except SystemToolProtectedError:
             # L'outil est déjà présent avec created_by="system" depuis disk.
             # On réinjecte uniquement l'executor (schema inchangé → stats OK).
-            registry._executors[name] = executor
+            registry.inject_executor(name, executor)
             reinjected += 1
             logger.debug("Builtin '%s' : executor réinjecté (schema disk conservé)", name)
 

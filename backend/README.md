@@ -1,6 +1,6 @@
 # # Assistant IA - Backend Python
 
-Backend Python pour agent autonome cognitif basé sur Ministral 3 14B avec MLX.
+Backend Python pour l'agent Iris — basé sur mlx-vlm (Apple Silicon) + Pydantic AI.
 
 ## Architecture
 ```
@@ -10,7 +10,7 @@ backend/
 ├── .env.example        # Template configuration
 ├── core/
 │   ├── __init__.py
-│   └── llm.py          # Wrapper MLX-LM
+│   └── llm.py          # Wrapper mlx-vlm (IrisEngine)
 ├── data/               # Données locales (gitignored)
 │   └── chroma/         # ChromaDB vectorstore
 ├── logs/               # Logs application (gitignored)
@@ -22,7 +22,7 @@ backend/
 
 - Python 3.11+
 - macOS avec Apple Silicon (M1/M2/M3/M4)
-- Ministral 3 14B modèle téléchargé localement
+- Gemma-4-26B (Q8_0) modèle téléchargé localement
 - 48GB RAM recommandé
 
 ## Installation
@@ -128,7 +128,7 @@ python tests/test_basic.py
 
 ### Backend ne démarre pas
 
-**Symptôme :** `ModuleNotFoundError: mlx_lm`
+**Symptôme :** `ModuleNotFoundError: mlx_vlm`
 **Solution :** 
 ```bash
 source venv/bin/activate
@@ -181,9 +181,9 @@ Tokens stream back
 **Pourquoi MLX-LM ?**
 - Optimisé Apple Silicon
 - Performance native Metal
-- Compatible Ministral 3 14B
+- Compatible Gemma-4-26B (Q8_0)
 
-**Pourquoi Ministral 3 14B ?**
+**Pourquoi Gemma-4-26B (Q8_0) ?**
 - Tool calling natif
 - Reasoning step-by-step
 - Sweet spot perf/qualité (14B)

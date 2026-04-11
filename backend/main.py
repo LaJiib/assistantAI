@@ -263,15 +263,10 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
 @app.post("/agent/chat", response_model=AgentChatResponse)
 async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
     """
-    Génère une réponse via l'agent Iris (Pydantic AI + tool calling).
+    [DEBUG] Génère une réponse via IrisAgent sans conversation persistée.
 
-    Différence avec /chat :
-      - Utilise IrisAgent (Pydantic AI) → supporte le tool calling multi-tours.
-      - Injecte IrisDeps (sera enrichi avec LanceDB en Étape 2).
-      - Résultat final après toutes les itérations de l'agent loop.
-
-    Usage recommandé pour les requêtes nécessitant des outils ou un raisonnement
-    multi-étapes. Pour un chat simple, /chat/stream est plus rapide.
+    Endpoint de test/debug uniquement. Le frontend utilise
+    POST /api/conversations/{id}/messages/ pour la génération persistée.
     """
     iris_agent = getattr(app.state, "iris_agent", None)
     engine: IrisEngine | None = getattr(app.state, "engine", None)
@@ -301,15 +296,11 @@ async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
 @app.post("/agent/chat/stream")
 def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
     """
-    Streaming SSE de l'Agent Iris — même identité qu'avec /agent/chat.
+    [DEBUG] Streaming SSE stateless via engine.stream_messages() + IRIS_SYSTEM_PROMPT.
 
-    Utilise engine.stream_messages() directement avec IRIS_SYSTEM_PROMPT injecté
-    en tête du contexte : le frontend envoie uniquement le message brut, toute la
-    personnalité et les instructions d'Iris restent côté backend.
-
-    Format SSE identique à /chat/stream :
-        data: {"text": "chunk"}\\n\\n
-        data: [DONE]\\n\\n
+    Endpoint de test/debug uniquement. Le frontend utilise
+    POST /api/conversations/{id}/messages/stream pour la génération avec
+    persistance et IrisAgent (Pydantic AI + tool calling).
     """
     engine: IrisEngine | None = getattr(app.state, "engine", None)
     max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))

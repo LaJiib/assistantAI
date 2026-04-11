@@ -78,7 +78,13 @@ class ConversationViewModel {
         clear(.prompt)
 
         generateTask = Task {
-            for try await chunk in ChatAPI.shared.streamAgentMessage(userContent) {
+            // Délègue à ConversationAPI → /api/conversations/{id}/messages/stream
+            // L'agent Iris (Pydantic AI) orchestre la génération côté backend.
+            // La persistance user + assistant est gérée par le backend.
+            for try await chunk in conversationAPI.sendMessage(
+                conversationID: conversation.id,
+                content: userContent
+            ) {
                 if let lastIndex = messages.indices.last,
                    messages[lastIndex].role == .assistant {
                     messages[lastIndex].content += chunk

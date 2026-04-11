@@ -1,5 +1,5 @@
 """
-Tests unitaires MinistralEngine — sans modèle requis.
+Tests unitaires IrisEngine — sans modèle requis.
 
 Usage : python3 tests/test_llm.py
 """
@@ -11,18 +11,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.llm import MinistralEngine
+from core.llm import IrisEngine
 
 
 def test_instanciation():
-    engine = MinistralEngine("/tmp/fake")
+    engine = IrisEngine("/tmp/fake")
     assert not engine.is_loaded
     assert engine.model_name == "fake"
     print("[OK] instanciation sans crash")
 
 
 def test_generate_avant_load():
-    engine = MinistralEngine("/tmp/fake")
+    engine = IrisEngine("/tmp/fake")
     try:
         engine.generate("test")
         assert False, "Doit lever RuntimeError"
@@ -32,7 +32,7 @@ def test_generate_avant_load():
 
 
 def test_stream_avant_load():
-    engine = MinistralEngine("/tmp/fake")
+    engine = IrisEngine("/tmp/fake")
     try:
         list(engine.stream("test"))
         assert False, "Doit lever RuntimeError"
@@ -42,9 +42,9 @@ def test_stream_avant_load():
 
 
 def test_interface_synchrone():
-    assert not inspect.iscoroutinefunction(MinistralEngine.generate)
-    assert not inspect.iscoroutinefunction(MinistralEngine.stream)
-    assert inspect.iscoroutinefunction(MinistralEngine.load)
+    assert not inspect.iscoroutinefunction(IrisEngine.generate)
+    assert not inspect.iscoroutinefunction(IrisEngine.stream)
+    assert inspect.iscoroutinefunction(IrisEngine.load)
     print("[OK] generate/stream sync, load async")
 
 

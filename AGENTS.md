@@ -11,7 +11,7 @@ Transformer l'actuel "AssistantAI" en un agent de consulting haute performance n
 ## 🛠 Stack Technique Cible
 
 ### 1. Inférence & Intelligence
-- **Moteur LLM** : `mlx-lm` (Optimisation native Apple Silicon).
+- **Moteur LLM** : `mlx-vlm` (Optimisation native Apple Silicon — vision + language).
 - **Modèle** : `google/gemma-4-26b-a4b` (Quantisation **Q8_0**).
 - **Orchestration** : `Pydantic AI` (Pour la rigueur du Tool Calling et de la logique agent).
 - **Streaming** : Support complet des Server-Sent Events (SSE) via FastAPI.

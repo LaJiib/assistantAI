@@ -12,7 +12,7 @@ Codes HTTP :
   201  Created        — POST réussi
   404  Not Found      — conversation_id inexistant
   422  Unprocessable  — validation Pydantic (contenu vide)
-  503  Service Unavailable — modèle non chargé
+  503  Service Unavailable — agent non initialisé
   500  Internal Error — erreur I/O ou génération inattendue
 
 Règles métier :
@@ -21,6 +21,7 @@ Règles métier :
   - Si génération échoue : message user conservé, pas de rollback
   - messageCount dans l'index = nombre de messages user+assistant (system exclu)
   - Streaming : accumulation mémoire → save unique à la fin (dans finally)
+  - Génération via IrisAgent (Pydantic AI) — tool calling et raisonnement multi-étapes
 
 Concurrence :
   - Lock par conversation_id : protège load→append→save contre requêtes simultanées
@@ -38,7 +39,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
+from pydantic_ai.settings import ModelSettings
 
+from core.agent import IrisDeps
 from models.conversation import Message, Role, _utcnow
 from storage.json_manager import JSONManager
 
@@ -70,18 +74,21 @@ def get_json_manager(request: Request) -> JSONManager:
     return request.app.state.json_manager
 
 
-def get_engine(request: Request):
-    """Injecte IrisEngine ou lève 503 si non chargé."""
+def get_iris_agent(request: Request):
+    """Injecte IrisAgent (Pydantic AI) ou lève 503 si non initialisé."""
+    agent = getattr(request.app.state, "iris_agent", None)
     engine = getattr(request.app.state, "engine", None)
-    if engine is None or not engine.is_loaded:
+    if agent is None or engine is None or not engine.is_loaded:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Modèle non chargé. Réessayez dans quelques secondes.",
+            detail="Agent Iris non initialisé. Réessayez dans quelques secondes.",
         )
-    return engine
+    return agent
+
 
 def get_max_generation_tokens(request: Request) -> int:
     return int(getattr(request.app.state, "max_generation_tokens", 512))
+
 
 def get_max_generation_temperature(request: Request) -> float:
     return float(getattr(request.app.state, "max_generation_temperature", 0.3))
@@ -90,9 +97,9 @@ def get_max_generation_temperature(request: Request) -> float:
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class SendMessageRequest(BaseModel):
-    content:     str   = Field(..., min_length=1, max_length=32000,
-                                description="Contenu du message utilisateur")
-    max_tokens:  int | None   = Field(None, gt=0, le=32768)
+    content:     str         = Field(..., min_length=1, max_length=32000,
+                                     description="Contenu du message utilisateur")
+    max_tokens:  int | None  = Field(None, gt=0, le=32768)
     temperature: float | None = Field(None, ge=0.0, le=2.0)
 
 
@@ -151,15 +158,22 @@ def _load_conversation_or_404(conversation_id: str, jm: JSONManager):
         )
 
 
-def _build_messages_for_llm(conv) -> List[Dict[str, str]]:
+def _build_message_history(conv) -> list:
     """
-    Convertit messages[] en liste de dicts pour apply_chat_template.
-    Inclut le message system et tout l'historique pour le contexte multi-turn.
+    Convertit l'historique JSON en list[ModelMessage] pour Pydantic AI.
+
+    Le message system est exclu : il est injecté par l'agent via IRIS_SYSTEM_PROMPT.
+    Seuls user et assistant sont convertis pour le contexte multi-turn.
     """
-    result = []
+    history = []
     for msg in conv.messages:
-        result.append({"role": msg.role.value, "content": msg.content})
-    return result
+        if msg.role == Role.system:
+            continue
+        elif msg.role == Role.user:
+            history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
+        elif msg.role == Role.assistant:
+            history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
+    return history
 
 
 def _update_index_message_count(conversation_id: str, delta: int, jm: JSONManager) -> None:
@@ -185,6 +199,7 @@ def _update_index_message_count(conversation_id: str, delta: int, jm: JSONManage
             new_index.append(meta)
     jm.save_index(new_index)
 
+
 def _normalize_conversation_id(raw_id: str) -> str:
     try:
         return str(UUID(raw_id))
@@ -193,6 +208,7 @@ def _normalize_conversation_id(raw_id: str) -> str:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"conversation_id invalide: {raw_id}",
         )
+
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -225,11 +241,11 @@ def get_messages(
     status_code=status.HTTP_201_CREATED,
     summary="Envoyer un message et obtenir une réponse",
 )
-def send_message(
+async def send_message(
     conversation_id: str,
     body: SendMessageRequest,
     jm: JSONManager = Depends(get_json_manager),
-    engine=Depends(get_engine),
+    iris_agent=Depends(get_iris_agent),
     max_generation_tokens: int = Depends(get_max_generation_tokens),
     max_generation_temperature: float = Depends(get_max_generation_temperature),
 ) -> SendMessageResponse:
@@ -237,62 +253,55 @@ def send_message(
     Workflow :
       1. Vérifier que la conversation existe (404 sinon)
       2. Créer et sauvegarder le message user immédiatement (persistance avant génération)
-      3. Générer la réponse assistant (bloquant, ~5-10s)
+      3. Générer la réponse via IrisAgent (Pydantic AI + tool calling)
       4. Sauvegarder le message assistant
       5. Mettre à jour messageCount (+2) dans l'index
       6. Retourner {userMessage, assistantMessage}
-
-    Si la génération échoue à l'étape 3 : le message user reste sauvegardé
-    (pas de rollback — l'utilisateur peut voir et réessayer).
     """
     conversation_id = _normalize_conversation_id(conversation_id)
-    requested_max_tokens = (
-        body.max_tokens if body.max_tokens is not None else max_generation_tokens
+    effective_max_tokens = min(
+        body.max_tokens if body.max_tokens is not None else max_generation_tokens,
+        max_generation_tokens,
     )
-    requested_temperature = (
-        body.temperature if body.temperature is not None else max_generation_temperature
+    effective_temperature = min(
+        body.temperature if body.temperature is not None else max_generation_temperature,
+        max_generation_temperature,
     )
-    effective_max_tokens = min(requested_max_tokens, max_generation_tokens)
-    effective_temperature = min(requested_temperature, max_generation_temperature)
     _get_meta_or_404(conversation_id, jm)
 
     lock = _get_conv_lock(conversation_id)
     with lock:
         conv = _load_conversation_or_404(conversation_id, jm)
-
-        # ── Étape 1 : créer et sauvegarder le message user ────────────────────
         user_msg = Message(role=Role.user, content=body.content)
         conv.messages.append(user_msg)
         jm.save_conversation(conv)
 
-    # ── Étape 2 : générer la réponse (hors lock pour ne pas bloquer les autres conv) ──
-    # Note : la génération peut durer plusieurs secondes. On libère le lock
-    # pendant la génération → une autre requête sur la MÊME conversation
-    # lirait un état avec user_msg mais sans assistant. Acceptable : le lock
-    # sera réacquis pour l'écriture finale.
     try:
-        messages_for_llm = _build_messages_for_llm(conv)
-        assistant_text = engine.generate_messages(
-            messages_for_llm,
+        message_history = _build_message_history(conv)
+        settings = ModelSettings(
             max_tokens=effective_max_tokens,
             temperature=effective_temperature,
         )
-    except RuntimeError as exc:
+        result = await iris_agent.run(
+            body.content,
+            deps=IrisDeps(),
+            message_history=message_history,
+            model_settings=settings,
+        )
+        assistant_text = result.data
+    except Exception as exc:
         logger.error("Génération échouée pour %s : %s", conversation_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur génération : {exc}",
         )
 
-    # ── Étape 3 : sauvegarder le message assistant ────────────────────────────
     with lock:
-        # Recharger pour capturer d'éventuelles écritures concurrentes
         conv = _load_conversation_or_404(conversation_id, jm)
         assistant_msg = Message(role=Role.assistant, content=assistant_text)
         conv.messages.append(assistant_msg)
         jm.save_conversation(conv)
 
-    # ── Étape 4 : mettre à jour l'index ───────────────────────────────────────
     _update_index_message_count(conversation_id, delta=2, jm=jm)
 
     logger.info(
@@ -310,20 +319,23 @@ def send_message(
     "/stream",
     summary="Envoyer un message avec réponse en streaming SSE",
 )
-def send_message_stream(
+async def send_message_stream(
     conversation_id: str,
     body: SendMessageRequest,
     jm: JSONManager = Depends(get_json_manager),
-    engine=Depends(get_engine),
+    iris_agent=Depends(get_iris_agent),
     max_generation_tokens: int = Depends(get_max_generation_tokens),
     max_generation_temperature: float = Depends(get_max_generation_temperature),
 ) -> StreamingResponse:
     """
-    Même workflow que POST / mais la réponse assistant est streamée en SSE.
+    Même workflow que POST / mais la réponse assistant est streamée via SSE.
+
+    Génération via iris_agent.run_stream() (Pydantic AI) — tool calling inclus.
 
     Format SSE :
-        data: {"text": "chunk"}\\n\\n     — token(s) générés
-        data: [DONE]\\n\\n                — fin de génération (messages sauvegardés)
+        data: {"userMessage": {...}}\\n\\n  — confirmation message user (1er event)
+        data: {"text": "chunk"}\\n\\n       — token(s) générés
+        data: [DONE]\\n\\n                  — fin (messages sauvegardés)
 
     Erreur pendant stream :
         data: {"error": "message"}\\n\\n
@@ -334,19 +346,19 @@ def send_message_stream(
     sauvegardé pour éviter la perte de données.
     """
     conversation_id = _normalize_conversation_id(conversation_id)
-    requested_max_tokens = (
-        body.max_tokens if body.max_tokens is not None else max_generation_tokens
+    effective_max_tokens = min(
+        body.max_tokens if body.max_tokens is not None else max_generation_tokens,
+        max_generation_tokens,
     )
-    requested_temperature = (
-        body.temperature if body.temperature is not None else max_generation_temperature
+    effective_temperature = min(
+        body.temperature if body.temperature is not None else max_generation_temperature,
+        max_generation_temperature,
     )
-    effective_max_tokens = min(requested_max_tokens, max_generation_tokens)
-    effective_temperature = min(requested_temperature, max_generation_temperature)
     _get_meta_or_404(conversation_id, jm)
 
     lock = _get_conv_lock(conversation_id)
 
-    def sse_generator():
+    async def sse_generator():
         # ── Étape 1 : sauvegarder le message user ─────────────────────────────
         with lock:
             conv = _load_conversation_or_404(conversation_id, jm)
@@ -354,30 +366,34 @@ def send_message_stream(
             conv.messages.append(user_msg)
             jm.save_conversation(conv)
 
-        # Envoyer confirmation message user (optionnel, aide le client à afficher
-        # le message user immédiatement sans attendre la fin du stream)
         yield f"data: {json.dumps({'userMessage': MessageResponse.from_model(user_msg).model_dump()})}\n\n"
 
-        # ── Étape 2 : streamer la génération ──────────────────────────────────
-        messages_for_llm = _build_messages_for_llm(conv)
-        accumulated_text = []
+        # ── Étape 2 : streamer via IrisAgent ──────────────────────────────────
+        message_history = _build_message_history(conv)
+        settings = ModelSettings(
+            max_tokens=effective_max_tokens,
+            temperature=effective_temperature,
+        )
+        accumulated: list[str] = []
 
         try:
-            for chunk in engine.stream_messages(
-                messages_for_llm,
-                max_tokens=effective_max_tokens,
-                temperature=effective_temperature,
-            ):
-                accumulated_text.append(chunk)
-                yield f"data: {json.dumps({'text': chunk})}\n\n"
+            async with iris_agent.run_stream(
+                body.content,
+                deps=IrisDeps(),
+                message_history=message_history,
+                model_settings=settings,
+            ) as result:
+                async for chunk in result.stream_text(delta=True):
+                    accumulated.append(chunk)
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
 
-        except RuntimeError as exc:
+        except Exception as exc:
             logger.error("Erreur stream [%s] : %s", conversation_id, exc)
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
         finally:
             # ── Étape 3 : sauvegarder le message assistant (partiel si crash) ─
-            assistant_text = "".join(accumulated_text)
+            assistant_text = "".join(accumulated)
             if assistant_text:
                 with lock:
                     try:
@@ -393,7 +409,6 @@ def send_message_stream(
                     except Exception as save_exc:
                         logger.error("Erreur save post-stream [%s] : %s", conversation_id, save_exc)
             else:
-                # User message sauvegardé mais génération vide → +1 seulement
                 _update_index_message_count(conversation_id, delta=1, jm=jm)
 
             yield "data: [DONE]\n\n"

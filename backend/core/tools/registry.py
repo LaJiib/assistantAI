@@ -237,6 +237,16 @@ class ToolRegistry:
 
     # ── Requêtes (lecture) ────────────────────────────────────────────────────
 
+    def inject_executor(self, name: str, executor: Callable[..., Any]) -> None:
+        """
+        Injecte un callable runtime pour un outil déjà enregistré (schema sur disk).
+
+        Utilisé au redémarrage pour re-brancher les exécuteurs builtin sans
+        avoir à supprimer et ré-enregistrer le schema (qui est protégé system).
+        """
+        self._executors[name] = executor
+        logger.debug("Registry : exécuteur injecté pour '%s'", name)
+
     def get(self, name: str) -> ToolSchema | None:
         """Retourne le schema d'un outil ou None si inconnu."""
         return self._tools.get(name)

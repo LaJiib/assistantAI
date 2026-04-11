@@ -77,7 +77,6 @@ private struct APIMessage: Decodable {
 
 private struct APIConversation: Decodable {
     let id: UUID
-    let systemPrompt: String
     let messages: [APIMessage]
 }
 

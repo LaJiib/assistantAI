@@ -209,10 +209,9 @@ def create_conversation(
     now = _utcnow()
 
     # Créer la conversation avec message system initial (compat Swift)
-    system_msg = Message(timestamp=now)
     conv = Conversation(
         id=conv_id,
-        messages=[system_msg],
+        messages=[],
     )
 
     meta = ConversationMetadata(

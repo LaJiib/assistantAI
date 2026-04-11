@@ -254,6 +254,12 @@ actor ConversationAPI {
                         temperature: temperature
                     ))
 
+                    if let bodyData = request.httpBody, let jsonString = String(data: bodyData, encoding: .utf8) {
+                        print("[ConversationAPI] PAYLOAD EXACT ENVOYÉ : \(jsonString)")
+                    } else {
+                        print("[ConversationAPI] Impossible de lire le payload HTTP.")
+                    }
+
                     let config = URLSessionConfiguration.default
                     config.timeoutIntervalForRequest  = 60
                     config.timeoutIntervalForResource = 300

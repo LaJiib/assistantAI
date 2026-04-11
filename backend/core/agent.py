@@ -33,15 +33,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ModelResponseStreamEvent,  # type hint pour _get_event_iterator
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
@@ -54,6 +57,7 @@ from pydantic_ai.models import (
     ModelRequestParameters,
     ModelSettings,
     RequestUsage,
+    StreamedResponse,
     ToolDefinition,
 )
 
@@ -253,6 +257,87 @@ def _raw_to_model_response(
     )
 
 
+# ── IrisStreamedResponse — StreamedResponse pour mlx-vlm ─────────────────────
+
+@dataclass
+class IrisStreamedResponse(StreamedResponse):
+    """
+    Implémentation StreamedResponse pour IrisEngine (mlx-vlm).
+
+    Stratégie thread-safe :
+      - stream_messages() est synchrone et bloquant (tourne sur le GPU via mlx-vlm).
+      - On le démarre dans un thread dédié via asyncio.to_thread.
+      - Chaque chunk généré est mis dans une asyncio.Queue.
+      - _get_event_iterator() consomme la queue depuis l'event loop FastAPI.
+      - Le sentinel None signale la fin du stream (ou une exception).
+    """
+
+    _engine: IrisEngine = field(repr=False)
+    _mlx_messages: list[dict[str, Any]] = field(repr=False)
+    _max_tokens: int = field(repr=False)
+    _temperature: float = field(repr=False)
+    _model_name_str: str = field(repr=False)
+    _timestamp: datetime = field(repr=False)
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name_str
+
+    @property
+    def provider_name(self) -> str | None:
+        return "iris-mlx"
+
+    @property
+    def provider_url(self) -> str | None:
+        return None
+
+    @property
+    def timestamp(self) -> datetime:
+        return self._timestamp
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """
+        Démarre engine.stream_messages() dans un thread et yield les events Pydantic AI.
+
+        Chaque token est émis via ModelResponsePartsManager.handle_text_delta()
+        qui produit un PartStartEvent (premier token) puis des PartDeltaEvent (suivants).
+        """
+        queue: asyncio.Queue[str | Exception | None] = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+
+        def _stream_in_thread() -> None:
+            try:
+                for chunk in self._engine.stream_messages(
+                    self._mlx_messages,
+                    max_tokens=self._max_tokens,
+                    temperature=self._temperature,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        thread = threading.Thread(target=_stream_in_thread, daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                # handle_text_delta gère PartStartEvent (1er chunk) et PartDeltaEvent
+                for event in self._parts_manager.handle_text_delta(
+                    vendor_part_id=None,
+                    content=item,
+                ):
+                    yield event
+        finally:
+            thread.join(timeout=5)
+
+
 # ── IrisModel — wrapper Pydantic AI ──────────────────────────────────────────
 
 class IrisModel(Model):
@@ -345,6 +430,55 @@ class IrisModel(Model):
         logger.debug("[iris:agent] raw response [%d chars]: %r", len(raw_response), raw_response[:200])
 
         return _raw_to_model_response(raw_response, self.model_name, timestamp)
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> AsyncIterator[IrisStreamedResponse]:
+        """
+        Génère une réponse streamée token par token.
+
+        Note : mlx-vlm génère un flux texte continu — les tool calls ne peuvent
+        pas interrompre ce flux. Si le modèle émet un tool call en streaming
+        (token `[TOOL_CALLS]`), Pydantic AI le détectera dans les events et
+        basculera sur request() pour le tour suivant.
+        """
+        if not self._engine.is_loaded:
+            raise RuntimeError("IrisEngine non chargé. Appelez await engine.load() d'abord.")
+
+        all_tools = (
+            model_request_parameters.function_tools
+            + model_request_parameters.output_tools
+        )
+        tools_openai = _tool_defs_to_openai(all_tools) if all_tools else []
+        mlx_messages = _messages_to_mlx(messages)
+
+        max_tokens = 512
+        temperature = 0.3
+        if model_settings:
+            if hasattr(model_settings, "max_tokens") and model_settings.max_tokens:
+                max_tokens = model_settings.max_tokens
+            if hasattr(model_settings, "temperature") and model_settings.temperature is not None:
+                temperature = model_settings.temperature
+
+        logger.info(
+            "[iris:agent] request_stream — %d messages, %d tools",
+            len(mlx_messages),
+            len(tools_openai),
+        )
+
+        yield IrisStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _engine=self._engine,
+            _mlx_messages=mlx_messages,
+            _max_tokens=max_tokens,
+            _temperature=temperature,
+            _model_name_str=self.model_name,
+            _timestamp=datetime.now(tz=timezone.utc),
+        )
 
 
 # ── Factory create_iris_agent ─────────────────────────────────────────────────

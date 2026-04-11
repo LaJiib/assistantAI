@@ -146,7 +146,7 @@ class ConversationViewModel {
     func clear(_ options: ClearOption) {
         if options.contains(.prompt) { prompt = "" }
         if options.contains(.chat) {
-            conversation.messages = [.system(conversation.systemPrompt)]
+            conversation.messages = []
             generateTask?.cancel()
         }
         errorMessage = nil

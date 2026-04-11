@@ -158,7 +158,7 @@ struct MessageView: View {
 
 #Preview {
     VStack(spacing: 20) {
-        MessageView(.system(Constants.defaultSystemPrompt))
+        MessageView(.system("Test"))
 
         MessageView(.user("Montre-moi une fonction Python simple"))
 

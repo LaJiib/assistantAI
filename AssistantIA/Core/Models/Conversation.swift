@@ -9,18 +9,15 @@ import Foundation
 
 struct Conversation: Identifiable, Codable, Equatable {
     let id: UUID
-    let systemPrompt: String
     var messages: [Message]
 
-    init(id: UUID, systemPrompt: String) {
+    init(id: UUID) {
         self.id = id
-        self.systemPrompt = systemPrompt
-        self.messages = [.system(systemPrompt)]
+        self.messages = []
     }
 
-    init(id: UUID, systemPrompt: String, messages: [Message]) {
+    init(id: UUID, messages: [Message]) {
         self.id = id
-        self.systemPrompt = systemPrompt
         self.messages = messages
     }
 }

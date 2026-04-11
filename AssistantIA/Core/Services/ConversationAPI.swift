@@ -84,7 +84,6 @@ private struct APIConversation: Decodable {
 private struct APIConversationMetadata: Decodable {
     let id: UUID
     let title: String
-    let systemPrompt: String
     let createdAt: Date
     let updatedAt: Date
     let messageCount: Int
@@ -106,7 +105,6 @@ private struct SSEChunk: Decodable {
 
 private struct CreateConversationBody: Encodable {
     let title:        String
-    let systemPrompt: String
 }
 
 private struct UpdateConversationBody: Encodable {
@@ -164,10 +162,10 @@ actor ConversationAPI {
 
     /// POST /api/conversations/ → crée et retourne les métadonnées.
     @discardableResult
-    func createConversation(title: String, systemPrompt: String) async throws -> ConversationMetadata {
+    func createConversation(title: String) async throws -> ConversationMetadata {
         var request = makeRequest(method: "POST", path: "/api/conversations/")
         request.httpBody = try encoder.encode(
-            CreateConversationBody(title: title, systemPrompt: systemPrompt)
+            CreateConversationBody(title: title)
         )
         let data = try await perform(request, expectedStatuses: [201])
         let meta = try decode(APIConversationMetadata.self, from: data)
@@ -390,7 +388,6 @@ actor ConversationAPI {
     private func toDomain(_ conversation: APIConversation) -> Conversation {
         Conversation(
             id: conversation.id,
-            systemPrompt: conversation.systemPrompt,
             messages: conversation.messages.map(toDomain)
         )
     }
@@ -399,7 +396,6 @@ actor ConversationAPI {
         ConversationMetadata(
             id: meta.id,
             title: meta.title,
-            systemPrompt: meta.systemPrompt,
             createdAt: meta.createdAt,
             updatedAt: meta.updatedAt,
             messageCount: meta.messageCount

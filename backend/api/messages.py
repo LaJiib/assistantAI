@@ -189,7 +189,6 @@ def _update_index_message_count(conversation_id: str, delta: int, jm: JSONManage
             updated = ConversationMetadata(
                 id=meta.id,
                 title=meta.title,
-                systemPrompt=meta.systemPrompt,
                 createdAt=meta.createdAt,
                 updatedAt=_utcnow(),
                 messageCount=meta.messageCount + delta,

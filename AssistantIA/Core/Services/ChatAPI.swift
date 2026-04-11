@@ -27,73 +27,6 @@ final class ChatAPI {
         self.session = URLSession(configuration: config)
     }
 
-    // MARK: - Public API
-
-    /// Génération complète : POST /chat → retourne la réponse en une fois.
-    func sendMessage(
-        _ prompt: String,
-        maxTokens: Int? = nil,
-        temperature: Float? = nil
-    ) async throws -> String {
-        var request = makeRequest(path: "/chat")
-        let body = ChatRequest(prompt: prompt, max_tokens: maxTokens, temperature: temperature)
-        request.httpBody = try JSONEncoder().encode(body)
-
-        let (data, response) = try await session.data(for: request)
-        try validateHTTPResponse(response, data: data)
-
-        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-        return decoded.response
-    }
-
-    /// Streaming SSE : POST /chat/stream → yield les chunks de texte au fil des tokens.
-    ///
-    /// Utilisation :
-    /// ```swift
-    /// for try await chunk in chatAPI.streamMessage("Bonjour") {
-    ///     text += chunk
-    /// }
-    /// ```
-    func streamMessage(
-        _ prompt: String,
-        maxTokens: Int? = nil,
-        temperature: Float? = nil
-    ) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    var request = self.makeRequest(path: "/chat/stream")
-                    let body = ChatRequest(
-                        prompt: prompt,
-                        max_tokens: maxTokens,
-                        temperature: temperature
-                    )
-                    request.httpBody = try JSONEncoder().encode(body)
-
-                    let (bytes, response) = try await self.session.bytes(for: request)
-                    try self.validateHTTPResponse(response, data: nil)
-
-                    for try await line in bytes.lines {
-                        try Task.checkCancellation()
-                        self.handleSSELine(line, continuation: continuation)
-                    }
-
-                    continuation.finish()
-
-                } catch is CancellationError {
-                    continuation.finish(throwing: ChatAPIError.cancelled)
-                } catch let err as ChatAPIError {
-                    continuation.finish(throwing: err)
-                } catch {
-                    continuation.finish(throwing: self.classify(error))
-                }
-            }
-
-            // Propager la cancellation du stream vers la URLSession task
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
     // MARK: - Private: SSE Parser
 
     private func handleSSELine(
@@ -174,59 +107,6 @@ final class ChatAPI {
         default:
             return .httpError(urlError.errorCode, urlError.localizedDescription)
         }
-    }
-    /// Streaming SSE Agent Iris : POST /agent/chat/stream → yield les chunks token par token.
-    ///
-    /// Le frontend envoie uniquement le message brut via le champ `message`.
-    /// Le system prompt Iris est injecté exclusivement côté backend (core/agent.py).
-    func streamAgentMessage(
-        _ message: String,
-        maxTokens: Int? = nil,
-        temperature: Float? = nil
-    ) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    var request = self.makeRequest(path: "/agent/chat/stream")
-                    let body = AgentChatRequest(message: message, max_tokens: maxTokens, temperature: temperature)
-                    request.httpBody = try JSONEncoder().encode(body)
-
-                    let (bytes, response) = try await self.session.bytes(for: request)
-                    try self.validateHTTPResponse(response, data: nil)
-
-                    for try await line in bytes.lines {
-                        try Task.checkCancellation()
-                        self.handleSSELine(line, continuation: continuation)
-                    }
-                    continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish(throwing: ChatAPIError.cancelled)
-                } catch let err as ChatAPIError {
-                    continuation.finish(throwing: err)
-                } catch {
-                    continuation.finish(throwing: self.classify(error))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    /// Agent Iris : POST /agent/chat → retourne la réponse complète (tool calling inclus).
-    /// Utilise le champ `message` aligné sur AgentChatRequest côté Python.
-    func sendAgentMessage(
-        _ message: String,
-        maxTokens: Int? = nil,
-        temperature: Float? = nil
-    ) async throws -> String {
-        var request = makeRequest(path: "/agent/chat")
-        let body = AgentChatRequest(message: message, max_tokens: maxTokens, temperature: temperature)
-        request.httpBody = try JSONEncoder().encode(body)
-
-        let (data, response) = try await session.data(for: request)
-        try validateHTTPResponse(response, data: data)
-
-        let decoded = try JSONDecoder().decode(AgentChatResponse.self, from: data)
-        return decoded.response
     }
 
     /// Génération de titre : POST /agent/title → titre court ≤ 10 mots.

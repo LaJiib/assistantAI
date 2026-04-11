@@ -21,7 +21,6 @@ Codes HTTP :
 Règles métier :
   - createdAt immutable après création
   - updatedAt mis à jour à chaque PUT
-  - systemPrompt immutable (intégré dans messages[0])
   - Conversation créée avec message system initial (compatibilité Swift)
 """
 
@@ -61,8 +60,6 @@ def get_json_manager(request: Request) -> JSONManager:
 class CreateConversationRequest(BaseModel):
     title:        str = Field(..., min_length=1, max_length=500,
                                description="Titre de la conversation")
-    systemPrompt: str = Field(..., min_length=1, max_length=4000,
-                               description="Prompt système définissant le comportement")
 
 
 class UpdateConversationRequest(BaseModel):
@@ -95,7 +92,6 @@ class ConversationResponse(BaseModel):
     """Métadonnées seules — utilisé pour list et create."""
     id:           str
     title:        str
-    systemPrompt: str
     createdAt:    str
     updatedAt:    str
     messageCount: int
@@ -111,7 +107,6 @@ class ConversationDetailResponse(BaseModel):
     """Métadonnées + messages — utilisé pour GET /{id}."""
     id:           str
     title:        str
-    systemPrompt: str
     createdAt:    str
     updatedAt:    str
     messageCount: int
@@ -208,26 +203,21 @@ def create_conversation(
     jm: JSONManager = Depends(get_json_manager),
 ) -> ConversationResponse:
     """
-    Crée une nouvelle conversation avec un message system initial.
-
-    Le message system initial garantit la compatibilité avec les modèles
-    Swift qui initialisent messages = [.system(systemPrompt)].
+    Génère un UUID pour l'ID de la conversation. createdAt et updatedAt sont
     """
     conv_id = str(uuid4())
     now = _utcnow()
 
     # Créer la conversation avec message system initial (compat Swift)
-    system_msg = Message(role=Role.system, content=body.systemPrompt)
+    system_msg = Message(timestamp=now)
     conv = Conversation(
         id=conv_id,
-        systemPrompt=body.systemPrompt,
         messages=[system_msg],
     )
 
     meta = ConversationMetadata(
         id=conv_id,
         title=body.title,
-        systemPrompt=body.systemPrompt,
         createdAt=now,
         updatedAt=now,
         messageCount=0,  # le message system ne compte pas
@@ -277,7 +267,6 @@ def update_conversation(
 ) -> ConversationResponse:
     """
     Modifie le titre. updatedAt est mis à jour, createdAt reste immutable.
-    systemPrompt est immutable (non modifiable via cette API).
     """
     conversation_id = _normalize_conversation_id(conversation_id)
     meta = _get_meta_or_404(conversation_id, jm)
@@ -285,7 +274,6 @@ def update_conversation(
     updated_meta = ConversationMetadata(
         id=meta.id,
         title=body.title,
-        systemPrompt=meta.systemPrompt,
         createdAt=meta.createdAt,
         updatedAt=_utcnow(),
         messageCount=meta.messageCount,

@@ -50,7 +50,6 @@ class Message(BaseModel):
 class ConversationMetadata(BaseModel):
     id:           str
     title:        str
-    systemPrompt: str
     createdAt:    datetime = Field(default_factory=_utcnow)
     updatedAt:    datetime = Field(default_factory=_utcnow)
     messageCount: int      = 0
@@ -64,5 +63,4 @@ class ConversationMetadata(BaseModel):
 
 class Conversation(BaseModel):
     id:           str
-    systemPrompt: str
     messages:     List[Message] = Field(default_factory=list)

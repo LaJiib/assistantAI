@@ -47,8 +47,8 @@ def client(tmp_path: Path) -> TestClient:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _create_conv(client: TestClient, title: str = "Test", system: str = "Tu es un assistant.") -> dict:
-    resp = client.post("/api/conversations/", json={"title": title, "systemPrompt": system})
+def _create_conv(client: TestClient, title: str = "Test") -> dict:
+    resp = client.post("/api/conversations/", json={"title": title})
     assert resp.status_code == 201
     return resp.json()
 
@@ -93,12 +93,10 @@ def test_create_returns_201(client: TestClient) -> None:
     """POST / retourne 201 avec les métadonnées."""
     resp = client.post("/api/conversations/", json={
         "title": "Ma conversation",
-        "systemPrompt": "Tu es un assistant utile.",
     })
     assert resp.status_code == 201
     data = resp.json()
     assert data["title"] == "Ma conversation"
-    assert data["systemPrompt"] == "Tu es un assistant utile."
     assert data["messageCount"] == 0
     assert "id" in data
     assert "createdAt" in data
@@ -114,7 +112,7 @@ def test_create_file_exists(client: TestClient, tmp_path: Path) -> None:
 
 def test_create_has_system_message(client: TestClient) -> None:
     """La conversation créée contient un message system initial."""
-    conv = _create_conv(client, system="Prompt system test")
+    conv = _create_conv(client)
 
     resp = client.get(f"/api/conversations/{conv['id']}")
     assert resp.status_code == 200
@@ -128,7 +126,6 @@ def test_create_empty_title_returns_422(client: TestClient) -> None:
     """POST avec titre vide → 422 (validation Pydantic)."""
     resp = client.post("/api/conversations/", json={
         "title": "",
-        "systemPrompt": "Prompt.",
     })
     assert resp.status_code == 422
 
@@ -137,7 +134,6 @@ def test_create_title_too_long_returns_422(client: TestClient) -> None:
     """POST avec titre > 500 chars → 422."""
     resp = client.post("/api/conversations/", json={
         "title": "x" * 501,
-        "systemPrompt": "Prompt.",
     })
     assert resp.status_code == 422
 
@@ -146,7 +142,6 @@ def test_create_empty_system_prompt_returns_422(client: TestClient) -> None:
     """POST avec systemPrompt vide → 422."""
     resp = client.post("/api/conversations/", json={
         "title": "Titre",
-        "systemPrompt": "",
     })
     assert resp.status_code == 422
 
@@ -214,13 +209,6 @@ def test_update_title_updated_at_changes(client: TestClient) -> None:
     assert data["createdAt"] == created_at, "createdAt doit rester immutable"
     assert data["updatedAt"] > updated_at_before, "updatedAt doit être mis à jour"
 
-
-def test_update_system_prompt_not_changed(client: TestClient) -> None:
-    """PUT /{id} ne modifie pas systemPrompt."""
-    conv = _create_conv(client, system="Prompt original")
-
-    resp = client.put(f"/api/conversations/{conv['id']}", json={"title": "Nouveau titre"})
-    assert resp.json()["systemPrompt"] == "Prompt original"
 
 
 def test_update_nonexistent_returns_404(client: TestClient) -> None:

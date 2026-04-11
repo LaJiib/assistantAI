@@ -50,7 +50,7 @@ struct ChatView: View {
 }
 
 #Preview {
-    let conversation = Conversation(id: UUID(), systemPrompt: "Preview conversation")
+    let conversation = Conversation(id: UUID())
     let viewModel = ConversationViewModel(
         conversation: conversation,
         onDelete: { }

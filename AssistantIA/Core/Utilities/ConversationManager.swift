@@ -74,12 +74,10 @@ class ConversationManager {
     /// Async obligatoire : l'UUID est généré par le backend.
     @discardableResult
     func createConversation(
-        systemPrompt: String = Constants.defaultSystemPrompt,
         title: String = "Nouvelle Conversation"
     ) async throws -> ConversationMetadata {
         let meta = try await conversationAPI.createConversation(
-            title: title,
-            systemPrompt: systemPrompt
+            title: title
         )
         metadata.append(meta)
         activeConversationID = meta.id
@@ -145,7 +143,7 @@ class ConversationManager {
             return nil
         }
 
-        let placeholder = Conversation(id: conversationID, systemPrompt: meta.systemPrompt)
+        let placeholder = Conversation(id: conversationID)
 
         let viewModel = ConversationViewModel(
             conversation: placeholder,

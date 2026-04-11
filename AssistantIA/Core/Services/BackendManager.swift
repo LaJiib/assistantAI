@@ -54,7 +54,7 @@ final class BackendManager {
     private let pythonPath: String
     private let host = "127.0.0.1"
     private let port = 8000
-    private let startupTimeout: TimeInterval = 30
+    private let startupTimeout: TimeInterval = 60
     @ObservationIgnored private let adminAPI: BackendAdminAPI
 
     /// Nombre de redémarrages automatiques tentés après crash.

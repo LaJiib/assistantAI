@@ -343,7 +343,7 @@ def create_iris_agent(engine: IrisEngine) -> Agent[IrisDeps, str]:
       - IrisModel  : wrapper mlx-lm (A1)
       - IrisDeps   : injection LanceDB ready (Étape 2)
       - System prompt Iris (override possible par conversation via system_prompt=)
-      - result_type=str : réponse texte brute (extensible en Étape 4)
+      - output_type=str : réponse texte brute (extensible en Étape 4)
 
     Utilisation :
         agent = create_iris_agent(engine)
@@ -371,7 +371,7 @@ def create_iris_agent(engine: IrisEngine) -> Agent[IrisDeps, str]:
     agent: Agent[IrisDeps, str] = Agent(
         model=model,
         deps_type=IrisDeps,
-        result_type=str,
+        output_type=str,
         system_prompt=system_prompt,
     )
 

@@ -25,15 +25,11 @@ import logging
 import threading
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
-from mlx_lm import load as mlx_load, stream_generate
-from mlx_lm.sample_utils import make_sampler
+from mlx_vlm import load as mlx_load, stream_generate
 
-# KV Cache B1 — mlx_lm.models.cache (disponible depuis mlx-lm ~0.19)
-try:
-    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
-    _HAS_PROMPT_CACHE = True
-except ImportError:
-    _HAS_PROMPT_CACHE = False
+# KV Cache B1 — désactivé : mlx-vlm utilise prompt_cache_state= (API différente de mlx-lm)
+# TODO : ré-implémenter via mlx_vlm.models.cache.make_prompt_cache + prompt_cache_state=
+_HAS_PROMPT_CACHE = False
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +49,8 @@ class IrisEngine:
         await engine.stream_with_tools(...)        # agent loop async avec tool calling
 
     KV Cache B1 :
-        Actif si mlx_lm.cache disponible (mlx-lm >= 0.19).
-        Le system prompt d'Iris est pré-rempli une fois au load().
-        Chaque requête récupère le cache au baseline system (trim), puis génère.
-        Les requêtes avec un system prompt custom (conversations) bénéficient
-        du prefix matching automatique de mlx_lm sur les tokens communs.
+        Temporairement désactivé — mlx-vlm utilise prompt_cache_state= (API différente).
+        TODO : ré-implémenter via mlx_vlm.models.cache.make_prompt_cache.
     """
 
     # System prompt par défaut d'Iris — pré-rempli dans le KV cache au chargement.
@@ -73,7 +66,8 @@ class IrisEngine:
     def __init__(self, model_path: str) -> None:
         self.model_path = model_path
         self._model = None
-        self._tokenizer = None
+        self._processor = None   # mlx-vlm processor (passé à stream_generate)
+        self._tokenizer = None   # processor.tokenizer (pour apply_chat_template)
         self._is_loaded = False
 
         # KV Cache B1 — system prompt pre-fill
@@ -97,21 +91,23 @@ class IrisEngine:
 
         Étapes :
           1. Chargement modèle + tokenizer via mlx_load (bloquant → executor)
-          2. Warm-up KV cache avec IRIS_SYSTEM_PROMPT (si mlx_lm.cache dispo)
+          2. Warm-up KV cache avec IRIS_SYSTEM_PROMPT (désactivé — voir _HAS_PROMPT_CACHE)
         """
         if self._is_loaded:
             return
         loop = asyncio.get_running_loop()
-        self._model, self._tokenizer = await loop.run_in_executor(
+        self._model, self._processor = await loop.run_in_executor(
             None, mlx_load, self.model_path
         )
+        # Extraire le tokenizer sous-jacent pour apply_chat_template
+        self._tokenizer = getattr(self._processor, "tokenizer", self._processor)
         self._is_loaded = True
         logger.info("✅ Modèle chargé : %s", self.model_name)
 
         if _HAS_PROMPT_CACHE:
             await loop.run_in_executor(None, self._warm_system_cache_sync)
         else:
-            logger.info("ℹ️  KV Cache B1 : mlx_lm.cache non disponible, génération standard")
+            logger.info("ℹ️  KV Cache B1 : désactivé (mlx-vlm — re-implémentation à venir)")
 
     def _warm_system_cache_sync(self) -> None:
         """
@@ -140,11 +136,10 @@ class IrisEngine:
             # Préfill : max_tokens=1 pour déclencher le forward pass puis on stoppe
             for _ in stream_generate(
                 self._model,
-                self._tokenizer,
+                self._processor,
                 prompt=formatted,
                 max_tokens=1,
-                sampler=make_sampler(temp=0.0),
-                prompt_cache=self._prompt_cache,
+                temp=0.0,
             ):
                 break  # Un seul forward pass suffit pour remplir le cache
 
@@ -177,9 +172,6 @@ class IrisEngine:
             messages : [{role, content}] dans l'ordre chronologique.
                        apply_chat_template() applique le template natif du modèle
                        → support multi-turn et system prompt correct.
-
-        KV Cache B1 : si actif, mlx_lm détecte le préfixe system commun et évite
-        de recalculer ses K/V → économie ~200ms sur chaque requête.
 
         Thread-safe : _cache_lock sérialise l'accès au cache partagé.
         """
@@ -236,8 +228,7 @@ class IrisEngine:
         Avec cache actif :
           1. Acquire _cache_lock (sérialise les requêtes — GPU = 1 stream max)
           2. trim_prompt_cache → remet le cache au baseline system prompt
-          3. stream_generate avec prompt_cache → mlx_lm détecte le préfixe commun,
-             skipe les tokens system, traite uniquement les nouveaux tokens
+          3. stream_generate avec prompt_cache (désactivé pour mlx-vlm)
           4. Release lock dans finally (même si le générateur est abandonné)
 
         Sans cache : génération standard sans verrou.
@@ -257,11 +248,10 @@ class IrisEngine:
                     trim_prompt_cache(self._prompt_cache, surplus)
                 for response in stream_generate(
                     self._model,
-                    self._tokenizer,
+                    self._processor,
                     prompt=formatted_prompt,
                     max_tokens=max_tokens,
-                    sampler=make_sampler(temp=temperature),
-                    prompt_cache=self._prompt_cache,
+                    temp=temperature,
                 ):
                     yield response.text
                     last = response
@@ -270,10 +260,10 @@ class IrisEngine:
         else:
             for response in stream_generate(
                 self._model,
-                self._tokenizer,
+                self._processor,
                 prompt=formatted_prompt,
                 max_tokens=max_tokens,
-                sampler=make_sampler(temp=temperature),
+                temp=temperature,
             ):
                 yield response.text
                 last = response

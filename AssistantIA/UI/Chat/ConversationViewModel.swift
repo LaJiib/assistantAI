@@ -79,10 +79,8 @@ class ConversationViewModel {
         clear(.prompt)
 
         generateTask = Task {
-            for try await chunk in conversationAPI.sendMessage(
-                conversationID: conversation.id,
-                content: userContent
-            ) {
+            // Appel direct au nouvel endpoint Agent
+            for try await chunk in ChatAPI.shared.streamAgentChat(prompt: userContent) {
                 if let lastIndex = messages.indices.last,
                    messages[lastIndex].role == .assistant {
                     messages[lastIndex].content += chunk

@@ -175,6 +175,30 @@ final class ChatAPI {
             return .httpError(urlError.errorCode, urlError.localizedDescription)
         }
     }
+    func streamAgentChat(prompt: String) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    // On pointe vers le nouvel endpoint de l'Agent Iris
+                    var request = self.makeRequest(path: "/agent/chat")
+                    let body = ["prompt": prompt]
+                    request.httpBody = try JSONEncoder().encode(body)
+
+                    let (bytes, response) = try await self.session.bytes(for: request)
+                    try self.validateHTTPResponse(response, data: nil)
+
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        self.handleSSELine(line, continuation: continuation)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 // MARK: - Request / Response Models

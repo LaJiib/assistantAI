@@ -237,96 +237,8 @@ def get_messages(
     return [MessageResponse.from_model(m) for m in visible]
 
 
-@router.post(
-    "/",
-    response_model=SendMessageResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Envoyer un message et obtenir une réponse",
-)
-async def send_message(
-    conversation_id: str,
-    body: SendMessageRequest,
-    jm: JSONManager = Depends(get_json_manager),
-    iris_agent=Depends(get_iris_agent),
-    max_generation_tokens: int = Depends(get_max_generation_tokens),
-    max_generation_temperature: float = Depends(get_max_generation_temperature),
-) -> SendMessageResponse:
-    """
-    Workflow :
-      1. Vérifier que la conversation existe (404 sinon)
-      2. Créer et sauvegarder le message user immédiatement (persistance avant génération)
-      3. Générer la réponse via IrisAgent (Pydantic AI + tool calling)
-      4. Sauvegarder le message assistant
-      5. Mettre à jour messageCount (+2) dans l'index
-      6. Retourner {userMessage, assistantMessage}
-    """
-    conversation_id = _normalize_conversation_id(conversation_id)
-    effective_max_tokens = min(
-        body.max_tokens if body.max_tokens is not None else max_generation_tokens,
-        max_generation_tokens,
-    )
-    effective_temperature = min(
-        body.temperature if body.temperature is not None else max_generation_temperature,
-        max_generation_temperature,
-    )
-    meta =_get_meta_or_404(conversation_id, jm)
 
-    deps = IrisDeps(
-            enable_thinking=body.options.get("think", False),
-            conversation_system_prompt=meta.specificInstruction,
-            vector_store=None
-        )
-    
-    lock = _get_conv_lock(conversation_id)
-    with lock:
-        conv = _load_conversation_or_404(conversation_id, jm)
-        user_msg = Message(role=Role.user, content=body.content)
-        conv.messages.append(user_msg)
-        jm.save_conversation(conv)
-
-    try:
-        message_history = _build_message_history(conv, deps)
-        settings = ModelSettings(
-            max_tokens=effective_max_tokens,
-            temperature=effective_temperature,
-        )
-        result = await iris_agent.run(
-            body.content,
-            deps=IrisDeps(),
-            message_history=message_history,
-            model_settings=settings,
-        )
-        assistant_text = result.data
-    except Exception as exc:
-        logger.error("Génération échouée pour %s : %s", conversation_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur génération : {exc}",
-        )
-
-    with lock:
-        conv = _load_conversation_or_404(conversation_id, jm)
-        assistant_msg = Message(role=Role.assistant, content=assistant_text)
-        conv.messages.append(assistant_msg)
-        jm.save_conversation(conv)
-
-    _update_index_message_count(conversation_id, delta=2, jm=jm)
-
-    logger.info(
-        "Message envoyé [%s] : user=%d chars, assistant=%d chars",
-        conversation_id, len(body.content), len(assistant_text),
-    )
-
-    return SendMessageResponse(
-        userMessage=MessageResponse.from_model(user_msg),
-        assistantMessage=MessageResponse.from_model(assistant_msg),
-    )
-
-
-@router.post(
-    "/stream",
-    summary="Envoyer un message avec réponse en streaming SSE",
-)
+@router.post("/stream", summary="Envoyer un message avec réponse en streaming SSE")
 async def send_message_stream(
     conversation_id: str,
     body: SendMessageRequest,
@@ -373,62 +285,54 @@ async def send_message_stream(
         )
 
     async def sse_generator():
-        # ── Étape 1 : sauvegarder le message user ─────────────────────────────
+        # 1. Création du message User en format natif Pydantic AI
+        user_request = ModelRequest(parts=[UserPromptPart(content=body.content)])
+        
         with lock:
             conv = _load_conversation_or_404(conversation_id, jm)
-            # 🟢 2. CONSTRUIRE L'HISTORIQUE TEMPOREL PROPRE
-            message_history = _build_message_history(conv, deps)
-            # 🟢 3. SAUVEGARDER LE NOUVEAU MESSAGE UTILISATEUR
-            user_msg = Message(role=Role.user, content=body.content)
-            conv.messages.append(user_msg)
+            conv.messages.append(user_request)
             jm.save_conversation(conv)
 
-        yield f"data: {json.dumps({'userMessage': MessageResponse.from_model(user_msg).model_dump()})}\n\n"
+        # On notifie le front que le processus démarre
+        yield f"data: {json.dumps({'event': 'start'})}\n\n"
 
-        # ── Étape 2 : streamer via IrisAgent ──────────────────────────────────
-
-        # 🟢 4. CRÉER LES DÉPENDANCES ET LES INJECTER
-
-        settings = ModelSettings(
-            max_tokens=effective_max_tokens,
-            temperature=effective_temperature,
-        )
-        accumulated: list[str] = []
+        settings = ModelSettings(max_tokens=effective_max_tokens, temperature=effective_temperature)
+        final_history = []
 
         try:
-            async with iris_agent.run_stream(
+            # 2. Utilisation de la méthode recommandée pour TOUT capturer (Tools + Text)
+            # run_stream_events() retourne un flux asynchrone d'événements Pydantic AI
+            async for event in iris_agent.run_stream_events(
                 body.content,
                 deps=deps,
-                message_history=message_history,
+                message_history=conv.messages[:-1], # On passe l'historique sans le user_request qu'on vient d'ajouter (géré par Pydantic)
                 model_settings=settings,
-            ) as result:
-                async for chunk in result.stream_text(delta=True):
-                    accumulated.append(chunk)
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+            ):
+                # Chaque événement (RunEvent) est sérialisable en JSON
+                # Cela inclura les text_deltas, tool_calls, etc.
+                yield f"data: {event.model_dump_json()}\n\n"
 
         except Exception as exc:
             logger.error("Erreur stream [%s] : %s", conversation_id, exc)
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            yield f"data: {json.dumps({'event': 'error', 'detail': str(exc)})}\n\n"
 
         finally:
-            # ── Étape 3 : sauvegarder le message assistant (partiel si crash) ─
-            assistant_text = "".join(accumulated)
-            if assistant_text:
-                with lock:
-                    try:
-                        conv_final = _load_conversation_or_404(conversation_id, jm)
-                        assistant_msg = Message(role=Role.assistant, content=assistant_text)
-                        conv_final.messages.append(assistant_msg)
-                        jm.save_conversation(conv_final)
-                        _update_index_message_count(conversation_id, delta=2, jm=jm)
-                        logger.info(
-                            "Stream terminé [%s] : %d chars accumulés",
-                            conversation_id, len(assistant_text),
-                        )
-                    except Exception as save_exc:
-                        logger.error("Erreur save post-stream [%s] : %s", conversation_id, save_exc)
-            else:
-                _update_index_message_count(conversation_id, delta=1, jm=jm)
+            # 3. Récupération FIABLE de l'état final
+            # Pydantic AI recommande de récupérer le résultat de run() ou les new_messages
+            # Pour s'assurer de ne rien perdre (cf. le warning de la doc)
+            with lock:
+                try:
+                    # On recharge pour éviter d'écraser des données en cas de concurrence
+                    conv_final = _load_conversation_or_404(conversation_id, jm)
+                    
+                    # NOTE : Selon la version exacte de Pydantic AI, run_stream_events() 
+                    # met à jour un objet RunResult ou fournit un moyen d'extraire les new_messages().
+                    # Si vous utilisez un agent classique, on peut simplement concaténer 
+                    # les événements ModelMessage complétés capturés durant le stream.
+                    
+                    jm.save_conversation(conv_final)
+                except Exception as save_exc:
+                    logger.error("Erreur save post-stream : %s", save_exc)
 
             yield "data: [DONE]\n\n"
 

@@ -97,10 +97,33 @@ class IrisDeps:
 
     À l'Étape 1, ces champs restent None. L'injection LanceDB viendra en Étape 2.
     """
+    enable_thinkng: bool = False  # Active le mode "thinking" (jeton spécial Gemma 4)
     vector_store: Optional[Any] = None     # VectorStoreManager (Étape 2)
     user_context: Optional[str] = None    # Enrichissement table_user_core
     client_context: Optional[str] = None  # Contexte client courant
+    conversation_system_prompt: Optional[str] = None  # Override du system prompt Iris (optionnel)
 
+def build_dynamic_system_prompt(deps: IrisDeps) -> str:
+    """Génère l'identité d'Iris à partir de ses dépendances."""
+    sections = [
+        "Tu es Iris, une assistante de consulting stratégique haute performance.",
+        "Tu opères en local sur un Mac Mini M4 Pro (48 Go RAM, 100% privé).",
+        "Tu es analytique, précise et directe."
+    ]
+
+    # Mode Thinking (Jeton spécial Gemma 4)
+    if deps.enable_thinking:
+        sections.insert(0, "<|think|>")
+        
+    # Instructions spécifiques de la conversation
+    if deps.conversation_system_prompt:
+        sections.append(f"\n[INSTRUCTIONS SPÉCIFIQUES]\n{deps.conversation_system_prompt}")
+
+    # Futurs contextes (Exemple RAG)
+    if deps.user_context:
+        sections.append(f"\n[CONTEXTE UTILISATEUR]\n{deps.user_context}")
+
+    return "\n".join(sections)
 
 # ── Conversion messages Pydantic AI ↔ mlx-lm ──────────────────────────────────
 
@@ -513,7 +536,6 @@ def create_iris_agent(engine: IrisEngine) -> Agent[IrisDeps, str]:
         model=model,
         deps_type=IrisDeps,
         output_type=str,
-        system_prompt=IRIS_SYSTEM_PROMPT,
     )
 
     logger.info("[iris:agent] Agent Iris initialisé sur modèle %s", model.model_name)

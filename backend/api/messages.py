@@ -39,10 +39,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, SystemPromptPart, UserPromptPart, TextPart
 from pydantic_ai.settings import ModelSettings
 
-from core.agent import IrisDeps
+from core.agent import IrisDeps, build_dynamic_system_prompt
 from models.conversation import Message, Role, _utcnow
 from storage.json_manager import JSONManager
 
@@ -158,14 +158,15 @@ def _load_conversation_or_404(conversation_id: str, jm: JSONManager):
         )
 
 
-def _build_message_history(conv) -> list:
-    """
-    Convertit l'historique JSON en list[ModelMessage] pour Pydantic AI.
-
-    Le message system est exclu : il est injecté par l'agent via IRIS_SYSTEM_PROMPT.
-    Seuls user et assistant sont convertis pour le contexte multi-turn.
-    """
+# L'historique prend l'objet deps riche
+def _build_message_history(conv, deps: IrisDeps) -> list:
     history = []
+    
+    # 1. On demande au cerveau de construire le prompt parfait avec les deps
+    dynamic_prompt = build_dynamic_system_prompt(deps)
+    history.append(ModelRequest(parts=[SystemPromptPart(content=dynamic_prompt)]))
+    
+    # 2. On ajoute le dialogue (en ignorant l'ancien système BDD)
     for msg in conv.messages:
         if msg.role == Role.system:
             continue
@@ -173,6 +174,7 @@ def _build_message_history(conv) -> list:
             history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
         elif msg.role == Role.assistant:
             history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
+            
     return history
 
 
@@ -361,6 +363,11 @@ async def send_message_stream(
         # ── Étape 1 : sauvegarder le message user ─────────────────────────────
         with lock:
             conv = _load_conversation_or_404(conversation_id, jm)
+            # 🟢 1. EXTRAIRE LE MESSAGE SYSTÈME (S'IL EXISTE)
+            custom_sys_msg = next((m.content for m in conv.messages if m.role == Role.system), None)
+            # 🟢 2. CONSTRUIRE L'HISTORIQUE TEMPOREL PROPRE
+            message_history = _build_message_history(conv)
+            # 🟢 3. SAUVEGARDER LE NOUVEAU MESSAGE UTILISATEUR
             user_msg = Message(role=Role.user, content=body.content)
             conv.messages.append(user_msg)
             jm.save_conversation(conv)
@@ -368,7 +375,10 @@ async def send_message_stream(
         yield f"data: {json.dumps({'userMessage': MessageResponse.from_model(user_msg).model_dump()})}\n\n"
 
         # ── Étape 2 : streamer via IrisAgent ──────────────────────────────────
-        message_history = _build_message_history(conv)
+
+        # 🟢 4. CRÉER LES DÉPENDANCES ET LES INJECTER
+        deps = IrisDeps(conversation_system_prompt=custom_sys_msg)
+
         settings = ModelSettings(
             max_tokens=effective_max_tokens,
             temperature=effective_temperature,
@@ -378,7 +388,7 @@ async def send_message_stream(
         try:
             async with iris_agent.run_stream(
                 body.content,
-                deps=IrisDeps(),
+                deps=deps,
                 message_history=message_history,
                 model_settings=settings,
             ) as result:

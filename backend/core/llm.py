@@ -100,7 +100,7 @@ class IrisEngine:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            thinking=thinking,  # Paramètre pour activer le mode "thinking" (Gemma 4)
+            enable_thinking=thinking,  # Paramètre pour activer le mode "thinking" (Gemma 4)
         )
 
         logger.info("\n========================================================")
@@ -261,6 +261,7 @@ class IrisEngine:
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
         temperature: float,
+        enable_thinking: bool = False,
     ) -> str:
         """
         Génération synchrone complète (pour le tool calling loop).
@@ -284,6 +285,7 @@ class IrisEngine:
                 messages_with_tools,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,  # Paramètre pour activer le mode "thinking" (Gemma 4)
             )
         
 

@@ -110,10 +110,6 @@ def build_dynamic_system_prompt(deps: IrisDeps) -> str:
         "Tu opères en local sur un Mac Mini M4 Pro (48 Go RAM, 100% privé).",
         "Tu es analytique, précise et directe."
     ]
-
-    # Mode Thinking (Jeton spécial Gemma 4)
-    if deps.enable_thinking:
-        sections.insert(0, "<|think|>")
         
     # Instructions spécifiques de la conversation
     if deps.conversation_system_prompt:

@@ -101,6 +101,11 @@ class IrisEngine:
             add_generation_prompt=True,
         )
 
+        logger.info("\n========================================================")
+        logger.info("🔍 PROMPT STREAMING EXACT ENVOYÉ À GEMMA 4 :")
+        logger.info("\n%s", formatted)
+        logger.info("========================================================\n")
+
         yield from self._stream_raw(formatted, max_tokens, temperature)
 
     def generate_messages(
@@ -306,6 +311,7 @@ class IrisEngine:
                 tokenize=False,
                 add_generation_prompt=True,
             )
+        
 
         return "".join(self._stream_raw(formatted, max_tokens, temperature))
 

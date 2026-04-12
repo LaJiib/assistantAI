@@ -86,6 +86,7 @@ private struct APIConversationMetadata: Decodable {
     let createdAt: Date
     let updatedAt: Date
     let messageCount: Int
+    let specificInstruction: String?
 }
 
 private struct APISendMessageResponse: Decodable {
@@ -108,12 +109,14 @@ private struct CreateConversationBody: Encodable {
 
 private struct UpdateConversationBody: Encodable {
     let title: String
+    let specificInstruction: String?
 }
 
 private struct SendMessageBody: Encodable {
     let content:     String
     let max_tokens:  Int?
     let temperature: Float?
+    let options: [String: Bool]?
 }
 
 // MARK: - ConversationAPI
@@ -173,9 +176,9 @@ actor ConversationAPI {
 
     /// PUT /api/conversations/{id} → modifie le titre, retourne les métadonnées à jour.
     @discardableResult
-    func updateConversation(id: UUID, title: String) async throws -> ConversationMetadata {
+    func updateConversation(id: UUID, title: String? = nil, specificInstruction: String? = nil) async throws -> ConversationMetadata {
         var request = makeRequest(method: "PUT", path: "/api/conversations/\(id)")
-        request.httpBody = try encoder.encode(UpdateConversationBody(title: title))
+        request.httpBody = try encoder.encode(UpdateConversationBody(title: title!, specificInstruction: specificInstruction!))
         let data = try await perform(request)
         let meta = try decode(APIConversationMetadata.self, from: data)
         return toDomain(meta)
@@ -203,6 +206,7 @@ actor ConversationAPI {
     func sendMessageSync(
         conversationID: UUID,
         content: String,
+        options: [String: Bool]? = nil,
         maxTokens: Int? = nil,
         temperature: Float? = nil
     ) async throws -> (user: Message, assistant: Message) {
@@ -213,7 +217,8 @@ actor ConversationAPI {
         request.httpBody = try encoder.encode(SendMessageBody(
             content: content,
             max_tokens: maxTokens,
-            temperature: temperature
+            temperature: temperature,
+            options: options
         ))
         let data = try await perform(request, expectedStatuses: [201])
         let resp = try decode(APISendMessageResponse.self, from: data)
@@ -234,6 +239,7 @@ actor ConversationAPI {
     nonisolated func sendMessage(
         conversationID: UUID,
         content: String,
+        options: [String: Bool]? = nil,
         maxTokens: Int? = nil,
         temperature: Float? = nil
     ) -> AsyncThrowingStream<String, Error> {
@@ -251,7 +257,8 @@ actor ConversationAPI {
                     request.httpBody = try JSONEncoder().encode(SendMessageBody(
                         content: content,
                         max_tokens: maxTokens,
-                        temperature: temperature
+                        temperature: temperature,
+                        options: options
                     ))
 
                     if let bodyData = request.httpBody, let jsonString = String(data: bodyData, encoding: .utf8) {
@@ -403,7 +410,8 @@ actor ConversationAPI {
             title: meta.title,
             createdAt: meta.createdAt,
             updatedAt: meta.updatedAt,
-            messageCount: meta.messageCount
+            messageCount: meta.messageCount,
+            specificInstruction: meta.specificInstruction
         )
     }
 

@@ -97,7 +97,7 @@ class IrisDeps:
 
     À l'Étape 1, ces champs restent None. L'injection LanceDB viendra en Étape 2.
     """
-    enable_thinkng: bool = False  # Active le mode "thinking" (jeton spécial Gemma 4)
+    enable_thinking: bool = False  # Active le mode "thinking" (jeton spécial Gemma 4)
     vector_store: Optional[Any] = None     # VectorStoreManager (Étape 2)
     user_context: Optional[str] = None    # Enrichissement table_user_core
     client_context: Optional[str] = None  # Contexte client courant
@@ -301,6 +301,7 @@ class IrisStreamedResponse(StreamedResponse):
     _temperature: float = field(repr=False)
     _model_name_str: str = field(repr=False)
     _timestamp: datetime = field(repr=False)
+    _enable_thinking: bool = field(repr=False, default=False)
 
     @property
     def model_name(self) -> str:
@@ -334,6 +335,7 @@ class IrisStreamedResponse(StreamedResponse):
                     self._mlx_messages,
                     max_tokens=self._max_tokens,
                     temperature=self._temperature,
+                    thinking=self._enable_thinking,
                 ):
                     loop.call_soon_threadsafe(queue.put_nowait, chunk)
             except Exception as exc:
@@ -425,6 +427,10 @@ class IrisModel(Model):
         tools_openai = _tool_defs_to_openai(all_tools) if all_tools else []
         mlx_messages = _messages_to_mlx(messages)
 
+        enable_thinking = False
+        if run_context and hasattr(run_context.deps, 'enable_thinking'):
+            enable_thinking = run_context.deps.enable_thinking
+
         logger.info(
             "[iris:agent] request — %d messages, %d tools",
             len(mlx_messages),
@@ -449,6 +455,7 @@ class IrisModel(Model):
             tools_openai if tools_openai else None,
             max_tokens,
             temperature,
+            enable_thinking=enable_thinking,
         )
 
         logger.debug("[iris:agent] raw response [%d chars]: %r", len(raw_response), raw_response[:200])
@@ -481,6 +488,10 @@ class IrisModel(Model):
         tools_openai = _tool_defs_to_openai(all_tools) if all_tools else []
         mlx_messages = _messages_to_mlx(messages)
 
+        enable_thinking = False
+        if run_context and hasattr(run_context.deps, 'enable_thinking'):
+            enable_thinking = run_context.deps.enable_thinking
+
         max_tokens = 512
         temperature = 0.3
         if model_settings:
@@ -503,6 +514,7 @@ class IrisModel(Model):
             _temperature=temperature,
             _model_name_str=self.model_name,
             _timestamp=datetime.now(tz=timezone.utc),
+            _enable_thinking=enable_thinking,
         )
 
 

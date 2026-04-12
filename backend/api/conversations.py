@@ -61,11 +61,10 @@ class CreateConversationRequest(BaseModel):
     title:        str = Field(..., min_length=1, max_length=500,
                                description="Titre de la conversation")
 
-
 class UpdateConversationRequest(BaseModel):
-    title: str = Field(..., min_length=1, max_length=500,
+    title: str | None = Field(None, min_length=1, max_length=500,
                         description="Nouveau titre de la conversation")
-
+    specificInstruction: str | None = Field(None, description="Instructions spécifiques")
 
 # ── Schemas response ──────────────────────────────────────────────────────────
 
@@ -257,7 +256,7 @@ def get_conversation(
 @router.put(
     "/{conversation_id}",
     response_model=ConversationResponse,
-    summary="Modifier le titre d'une conversation",
+    summary="Modifier le titre ou les instructions spécifiques d'une conversation",
 )
 def update_conversation(
     conversation_id: str,
@@ -272,10 +271,11 @@ def update_conversation(
 
     updated_meta = ConversationMetadata(
         id=meta.id,
-        title=body.title,
+        title=body.title if body.title is not None else meta.title,
         createdAt=meta.createdAt,
         updatedAt=_utcnow(),
         messageCount=meta.messageCount,
+        specificInstruction=body.specificInstruction if body.specificInstruction is not None else meta.specificInstruction,
     )
 
     index = jm.load_index()

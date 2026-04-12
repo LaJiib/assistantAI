@@ -19,8 +19,10 @@ class ConversationViewModel {
     // MARK: - State
 
     var conversation: Conversation
+    var metadata: ConversationMetadata
     var prompt: String = ""
     var isGenerating = false
+    var messageOptions: [String: Bool] = ["think": false]
     var errorMessage: String? = nil
 
     var messages: [Message] {
@@ -44,11 +46,13 @@ class ConversationViewModel {
 
     init(
         conversation: Conversation,
+        metadata: ConversationMetadata,
         conversationAPI: ConversationAPI = .shared,
         onTitleGenerated: (@Sendable (String) -> Void)? = nil,
         onDelete: @escaping @Sendable () -> Void
     ) {
         self.conversation = conversation
+        self.metadata = metadata
         self.conversationAPI = conversationAPI
         self.onTitleGenerated = onTitleGenerated
         self.onDelete = onDelete
@@ -83,7 +87,8 @@ class ConversationViewModel {
             // La persistance user + assistant est gérée par le backend.
             for try await chunk in conversationAPI.sendMessage(
                 conversationID: conversation.id,
-                content: userContent
+                content: userContent,
+                options: messageOptions
             ) {
                 if let lastIndex = messages.indices.last,
                    messages[lastIndex].role == .assistant {

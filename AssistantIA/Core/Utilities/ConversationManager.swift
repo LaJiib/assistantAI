@@ -147,6 +147,7 @@ class ConversationManager {
 
         let viewModel = ConversationViewModel(
             conversation: placeholder,
+            metadata: meta,
             conversationAPI: conversationAPI,
             onTitleGenerated: { [weak self] title in
                 Task { @MainActor in

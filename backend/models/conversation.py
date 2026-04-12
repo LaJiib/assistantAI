@@ -53,7 +53,7 @@ class ConversationMetadata(BaseModel):
     createdAt:    datetime = Field(default_factory=_utcnow)
     updatedAt:    datetime = Field(default_factory=_utcnow)
     messageCount: int      = 0
-
+    specificInstruction: str | None = None  # Instruction spécifique à cette conversation (optionnel)
     @field_serializer("createdAt", "updatedAt")
     def serialize_datetime(self, v: datetime) -> str:
         if v.tzinfo is None:

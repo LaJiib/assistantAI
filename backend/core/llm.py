@@ -83,6 +83,7 @@ class IrisEngine:
         messages: List[Dict[str, str]],
         max_tokens: int = 512,
         temperature: float = 0.3,
+        thinking: bool = False,  # Active le mode "thinking" (jeton spécial Gemma 4)
     ) -> Iterator[str]:
         """
         Génère le texte chunk par chunk depuis un historique de messages.
@@ -99,6 +100,7 @@ class IrisEngine:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            thinking=thinking,  # Paramètre pour activer le mode "thinking" (Gemma 4)
         )
 
         logger.info("\n========================================================")
@@ -107,34 +109,6 @@ class IrisEngine:
         logger.info("========================================================\n")
 
         yield from self._stream_raw(formatted, max_tokens, temperature)
-
-    def generate_messages(
-        self,
-        messages: List[Dict[str, str]],
-        max_tokens: int = 512,
-        temperature: float = 0.3,
-    ) -> str:
-        """Retourne le texte complet depuis un historique de messages."""
-        return "".join(self.stream_messages(messages, max_tokens, temperature))
-
-    # ── API compat (prompt texte brut) ────────────────────────────────────────
-
-    def stream(
-        self,
-        prompt: str,
-        max_tokens: int = 512,
-        temperature: float = 0.3,
-    ) -> Iterator[str]:
-        """Génère depuis un prompt texte brut — message user unique."""
-        return self.stream_messages(
-            [{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
-    def generate(self, prompt: str, max_tokens: int = 512, temperature: float = 0.3) -> str:
-        """Retourne le texte complet depuis un prompt brut."""
-        return "".join(self.stream(prompt, max_tokens, temperature))
 
     # ── Core streaming avec gestion KV Cache ──────────────────────────────────
 

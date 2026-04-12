@@ -13,4 +13,5 @@ struct ConversationMetadata: Identifiable, Codable, Equatable {
     let createdAt: Date
     var updatedAt: Date
     var messageCount: Int          // pour afficher "X messages" sans charger le fichier
+    var specificInstruction: String?
 }

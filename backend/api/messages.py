@@ -101,6 +101,7 @@ class SendMessageRequest(BaseModel):
                                      description="Contenu du message utilisateur")
     max_tokens:  int | None  = Field(None, gt=0, le=32768)
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    options:     dict = Field(default_factory=dict)
 
 
 class MessageResponse(BaseModel):
@@ -268,8 +269,14 @@ async def send_message(
         body.temperature if body.temperature is not None else max_generation_temperature,
         max_generation_temperature,
     )
-    _get_meta_or_404(conversation_id, jm)
+    meta =_get_meta_or_404(conversation_id, jm)
 
+    deps = IrisDeps(
+            enable_thinking=body.options.get("think", False),
+            conversation_system_prompt=meta.specificInstruction,
+            vector_store=None
+        )
+    
     lock = _get_conv_lock(conversation_id)
     with lock:
         conv = _load_conversation_or_404(conversation_id, jm)
@@ -278,7 +285,7 @@ async def send_message(
         jm.save_conversation(conv)
 
     try:
-        message_history = _build_message_history(conv)
+        message_history = _build_message_history(conv, deps)
         settings = ModelSettings(
             max_tokens=effective_max_tokens,
             temperature=effective_temperature,
@@ -355,18 +362,22 @@ async def send_message_stream(
         body.temperature if body.temperature is not None else max_generation_temperature,
         max_generation_temperature,
     )
-    _get_meta_or_404(conversation_id, jm)
+    meta =_get_meta_or_404(conversation_id, jm)
 
     lock = _get_conv_lock(conversation_id)
+
+    deps = IrisDeps(
+            enable_thinking=body.options.get("think", False),
+            conversation_system_prompt=meta.specificInstruction,
+            vector_store=None
+        )
 
     async def sse_generator():
         # ── Étape 1 : sauvegarder le message user ─────────────────────────────
         with lock:
             conv = _load_conversation_or_404(conversation_id, jm)
-            # 🟢 1. EXTRAIRE LE MESSAGE SYSTÈME (S'IL EXISTE)
-            custom_sys_msg = next((m.content for m in conv.messages if m.role == Role.system), None)
             # 🟢 2. CONSTRUIRE L'HISTORIQUE TEMPOREL PROPRE
-            message_history = _build_message_history(conv)
+            message_history = _build_message_history(conv, deps)
             # 🟢 3. SAUVEGARDER LE NOUVEAU MESSAGE UTILISATEUR
             user_msg = Message(role=Role.user, content=body.content)
             conv.messages.append(user_msg)
@@ -377,7 +388,6 @@ async def send_message_stream(
         # ── Étape 2 : streamer via IrisAgent ──────────────────────────────────
 
         # 🟢 4. CRÉER LES DÉPENDANCES ET LES INJECTER
-        deps = IrisDeps(conversation_system_prompt=custom_sys_msg)
 
         settings = ModelSettings(
             max_tokens=effective_max_tokens,

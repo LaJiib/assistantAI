@@ -10,30 +10,49 @@ import SwiftUI
 struct PromptField: View {
     @Binding var prompt: String
     @State private var task: Task<Void, Never>?
+    @Binding var options: [String: Bool]
 
     let sendButtonAction: () async -> Void
     let canSend: Bool
 
     var body: some View {
-        HStack {
-            TextField("Prompt", text: $prompt)
-                .textFieldStyle(.roundedBorder)
-
-            Button {
-                if isRunning {
-                    task?.cancel()
-                    removeTask()
-                } else {
-                    task = Task {
-                        await sendButtonAction()
-                        removeTask()
-                    }
+        VStack(spacing: 8) {
+            HStack {
+                Toggle(isOn: Binding(
+                    get: { options["think"] ?? false },
+                    set: { options["think"] = $0 }
+                )) {
+                    Label("Mode Réflexion", systemImage:"brain.head.profile")
+                                .font(.caption)
                 }
-            } label: {
-                Image(systemName: isRunning ? "stop.circle.fill" : "paperplane.fill")
+                .toggleStyle(.button)
+                .buttonStyle(.bordered)
+                .tint(options["think"] == true ? .purple : .gray)
+                        
+                Spacer()
             }
-            .keyboardShortcut(isRunning ? .cancelAction : .defaultAction)
-            .disabled(!canSend && !isRunning)
+            .padding(.horizontal)
+            
+            HStack {
+                TextField("Prompt", text: $prompt)
+                    .textFieldStyle(.roundedBorder)
+                
+                Button {
+                    if isRunning {
+                        task?.cancel()
+                        removeTask()
+                    } else {
+                        task = Task {
+                            await sendButtonAction()
+                            removeTask()
+                        }
+                    }
+                } label: {
+                    Image(systemName: isRunning ? "stop.circle.fill" :  "paperplane.fill")
+                }
+                .keyboardShortcut(isRunning ? .cancelAction :   .defaultAction)
+                .disabled(!canSend && !isRunning)
+            }
         }
     }
 
@@ -49,6 +68,7 @@ struct PromptField: View {
 #Preview {
     PromptField(
         prompt: .constant(""),
+        options: .constant(["think": false]),
         sendButtonAction: { },
         canSend: true
     )

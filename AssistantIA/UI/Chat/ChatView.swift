@@ -31,6 +31,7 @@ struct ChatView: View {
                 // Input field with send and media attachment buttons
                 PromptField(
                     prompt: $vm.prompt,
+                    options: $vm.messageOptions,
                     sendButtonAction: vm.generate,
                     canSend: canSend
                 )
@@ -50,10 +51,27 @@ struct ChatView: View {
 }
 
 #Preview {
-    let conversation = Conversation(id: UUID())
+    // 1. Création d'un ID de test
+    let testID = UUID()
+    
+    // 2. Création d'objets de test valides (Mocks)
+    let conversation = Conversation(id: testID)
+    
+    let metadata = ConversationMetadata(
+        id: testID,
+        title: "Conversation de test",
+        createdAt: Date(),
+        updatedAt: Date(),
+        messageCount: 0,
+        specificInstruction: nil // On initialise avec rien
+    )
+    
+    // 3. Initialisation du ViewModel avec les deux arguments requis
     let viewModel = ConversationViewModel(
         conversation: conversation,
+        metadata: metadata,
         onDelete: { }
     )
+    
     ChatView(viewModel: viewModel)
 }

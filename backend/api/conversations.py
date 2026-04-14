@@ -27,18 +27,21 @@ Règles métier :
 from __future__ import annotations
 
 import logging
-from datetime import timezone
 from typing import List
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from itertools import zip_longest
+
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
+from core.sse_transformer import parse_thinking_tags
+
 from models.conversation import (
     Conversation,
     ConversationMetadata,
-    Message,
-    Role,
+    MessageMeta,
     _utcnow,
 )
 from storage.json_manager import JSONManager
@@ -68,23 +71,55 @@ class UpdateConversationRequest(BaseModel):
 
 # ── Schemas response ──────────────────────────────────────────────────────────
 
+class MessagePartResponse(BaseModel):
+    type:       str
+    content:    str | None = None
+    toolCallId: str | None = None
+    toolName:   str | None = None
+
+
 class MessageResponse(BaseModel):
+    """Format multi-parts — identique à celui de api/messages.py."""
     id:        str
     role:      str
-    content:   str
+    parts:     List[MessagePartResponse]
     timestamp: str
 
     @classmethod
-    def from_model(cls, msg: Message) -> "MessageResponse":
-        ts = msg.timestamp
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return cls(
-            id=str(msg.id),
-            role=msg.role.value,
-            content=msg.content,
-            timestamp=ts.isoformat(),
-        )
+    def from_model_message(
+        cls,
+        msg: ModelMessage,
+        meta: MessageMeta | None,
+    ) -> "MessageResponse | None":
+        ts = (meta.timestamp.isoformat() if meta else _utcnow().isoformat())
+        msg_id = str(meta.id) if meta else ""
+
+        if isinstance(msg, ModelRequest):
+            parts = [
+                MessagePartResponse(type="text", content=p.content if isinstance(p.content, str) else str(p.content))
+                for p in msg.parts if isinstance(p, UserPromptPart)
+            ]
+            if not parts:
+                return None
+            return cls(id=msg_id, role="user", parts=parts, timestamp=ts)
+
+        elif isinstance(msg, ModelResponse):
+            parts = []
+            for p in msg.parts:
+                if isinstance(p, TextPart) and p.content:
+                    for part_type, content in parse_thinking_tags(p.content):
+                        parts.append(MessagePartResponse(type=part_type, content=content))
+                elif isinstance(p, ToolCallPart):
+                    parts.append(MessagePartResponse(
+                        type="toolCall",
+                        toolCallId=p.tool_call_id,
+                        toolName=p.tool_name,
+                    ))
+            if not parts:
+                return None
+            return cls(id=msg_id, role="assistant", parts=parts, timestamp=ts)
+
+        return None
 
 
 class ConversationResponse(BaseModel):
@@ -97,13 +132,12 @@ class ConversationResponse(BaseModel):
 
     @classmethod
     def from_metadata(cls, meta: ConversationMetadata) -> "ConversationResponse":
-        # Utilise model_dump(mode="json") qui applique les field_serializer datetime
         d = meta.model_dump(mode="json")
         return cls(**d)
 
 
 class ConversationDetailResponse(BaseModel):
-    """Métadonnées + messages — utilisé pour GET /{id}."""
+    """Métadonnées + messages (format parts) — utilisé pour GET /{id}."""
     id:           str
     title:        str
     createdAt:    str
@@ -118,10 +152,11 @@ class ConversationDetailResponse(BaseModel):
         conv: Conversation,
     ) -> "ConversationDetailResponse":
         d = meta.model_dump(mode="json")
-        return cls(
-            **d,
-            messages=[MessageResponse.from_model(m) for m in conv.messages],
-        )
+        responses = [
+            MessageResponse.from_model_message(msg, m)
+            for msg, m in zip_longest(conv.messages, conv.message_meta)
+        ]
+        return cls(**d, messages=[r for r in responses if r is not None])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

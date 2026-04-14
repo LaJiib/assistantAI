@@ -83,7 +83,10 @@ class IrisEngine:
         messages: List[Dict[str, str]],
         max_tokens: int = 512,
         temperature: float = 0.3,
-        thinking: bool = False,  # Active le mode "thinking" (jeton spécial Gemma 4)
+        thinking: bool = False,
+        tools: list[dict[str, Any]] | None = None,
+        top_p: float = 0.0,
+        top_k: int = 0,
     ) -> Iterator[str]:
         """
         Génère le texte chunk par chunk depuis un historique de messages.
@@ -92,23 +95,35 @@ class IrisEngine:
             messages : [{role, content}] dans l'ordre chronologique.
                        apply_chat_template() applique le template natif du modèle
                        → support multi-turn et system prompt correct.
+            tools : liste de tools au format OpenAI à injecter via apply_chat_template().
         """
         if not self._is_loaded:
             raise RuntimeError("Modèle non chargé. Appelez await engine.load() d'abord.")
 
-        formatted = self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=thinking,  # Paramètre pour activer le mode "thinking" (Gemma 4)
-        )
+        try:
+            formatted = self._tokenizer.apply_chat_template(
+                messages,
+                tools=tools if tools else None,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=thinking,
+            )
+        except TypeError:
+            logger.warning("Tokenizer ne supporte pas tools=, fallback injection system prompt")
+            messages_with_tools = self._inject_tools_system_prompt(messages, tools or [])
+            formatted = self._tokenizer.apply_chat_template(
+                messages_with_tools,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=thinking,
+            )
 
         logger.info("\n========================================================")
         logger.info("🔍 PROMPT STREAMING EXACT ENVOYÉ À GEMMA 4 :")
         logger.info("\n%s", formatted)
         logger.info("========================================================\n")
 
-        yield from self._stream_raw(formatted, max_tokens, temperature)
+        yield from self._stream_raw(formatted, max_tokens, temperature, top_p=top_p, top_k=top_k)
 
     # ── Core streaming avec gestion KV Cache ──────────────────────────────────
 
@@ -117,10 +132,13 @@ class IrisEngine:
         formatted_prompt: str,
         max_tokens: int,
         temperature: float,
+        top_p: float = 0.0,
+        top_k: int = 0,
     ) -> Iterator[str]:
         """
         Streaming bas niveau via stream_generate (mlx-vlm).
         Logging : tokens générés et vitesse (tok/s) à la fin de chaque génération.
+        top_p / top_k : 0 = désactivé (comportement par défaut mlx-lm).
         """
         last = None
         for response in stream_generate(
@@ -129,6 +147,8 @@ class IrisEngine:
             prompt=formatted_prompt,
             max_tokens=max_tokens,
             temp=temperature,
+            top_p=top_p,
+            top_k=top_k,
         ):
             yield response.text
             last = response
@@ -262,6 +282,8 @@ class IrisEngine:
         max_tokens: int,
         temperature: float,
         enable_thinking: bool = False,
+        top_p: float = 0.0,
+        top_k: int = 0,
     ) -> str:
         """
         Génération synchrone complète (pour le tool calling loop).
@@ -289,7 +311,7 @@ class IrisEngine:
             )
         
 
-        return "".join(self._stream_raw(formatted, max_tokens, temperature))
+        return "".join(self._stream_raw(formatted, max_tokens, temperature, top_p=top_p, top_k=top_k))
 
     @staticmethod
     def _inject_tools_system_prompt(

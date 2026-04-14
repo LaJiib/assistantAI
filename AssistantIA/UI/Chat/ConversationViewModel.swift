@@ -1,14 +1,15 @@
 // ConversationViewModel.swift
 // AssistantIA
 //
-// Orchestrateur léger Phase 2bis : UI ↔ ConversationAPI.
+// Orchestrateur UI ↔ ConversationAPI.
 //
 // Responsabilités :
 //   - Append local immédiat des messages (UI réactive via @Observable)
-//   - Délègue génération + persistance à ConversationAPI (streaming SSE)
+//   - Délègue génération + persistance à ConversationAPI (streaming SSE typé)
+//   - Route les StreamEvent vers les parts du message assistant en cours
 //   - Génère le titre au 1er échange via ChatAPI (stateless, sans persistance message)
 //   - Notifie ConversationManager via onTitleGenerated (cache local)
-//   - Gère l'annulation mid-génération avec message partiel [Annulé]
+//   - Gère l'annulation mid-génération
 
 import SwiftUI
 
@@ -36,9 +37,6 @@ class ConversationViewModel {
     private var generateTask: Task<Void, any Error>?
     private var titleGenerated: Bool
 
-    /// Callback léger : notifie ConversationManager quand le titre a changé.
-    /// Le Manager met à jour son cache local (metadata[idx].title).
-    /// La persistance backend est gérée directement par le ViewModel via conversationAPI.
     private let onTitleGenerated: (@Sendable (String) -> Void)?
     private let onDelete: @Sendable () -> Void
 
@@ -56,18 +54,11 @@ class ConversationViewModel {
         self.conversationAPI = conversationAPI
         self.onTitleGenerated = onTitleGenerated
         self.onDelete = onDelete
-        // Titre déjà généré si l'échange initial (system+user+assistant) est passé
         self.titleGenerated = conversation.messages.count > 3
     }
 
     // MARK: - Generate
 
-    /// Envoie le texte brut au backend (Agent Iris) et affiche la réponse.
-    ///
-    /// Flux :
-    ///   1. Append user message localement (UI immédiate)
-    ///   2. POST /agent/chat — backend orchestre l'agent loop (tool calling inclus)
-    ///   3. Réponse finale appended en une fois (l'agent n'est pas streamable)
     func generate() async {
         if let existingTask = generateTask {
             existingTask.cancel()
@@ -81,20 +72,18 @@ class ConversationViewModel {
         messages.append(.user(userContent))
         clear(.prompt)
 
+        // Coquille vide pour l'assistant — parts se rempliront via handleStreamEvent
+        messages.append(.assistant())
+        let assistantIndex = messages.count - 1
+
         generateTask = Task {
-            // Délègue à ConversationAPI → /api/conversations/{id}/messages/stream
-            // L'agent Iris (Pydantic AI) orchestre la génération côté backend.
-            // La persistance user + assistant est gérée par le backend.
-            for try await chunk in conversationAPI.sendMessage(
+            for try await event in conversationAPI.sendMessage(
                 conversationID: conversation.id,
                 content: userContent,
                 options: messageOptions
             ) {
-                if let lastIndex = messages.indices.last,
-                   messages[lastIndex].role == .assistant {
-                    messages[lastIndex].content += chunk
-                } else {
-                    messages.append(.assistant(chunk))
+                await MainActor.run {
+                    self.handleStreamEvent(event, at: assistantIndex)
                 }
             }
         }
@@ -107,7 +96,7 @@ class ConversationViewModel {
                     self.generateTask?.cancel()
                     if let lastIndex = self.messages.indices.last,
                        self.messages[lastIndex].role == .assistant {
-                        self.messages[lastIndex].content += "\n[Annulé]"
+                        self.messages[lastIndex].parts.append(.text("\n[Annulé]"))
                     }
                 }
             }
@@ -122,14 +111,65 @@ class ConversationViewModel {
         generateTask = nil
     }
 
+    // MARK: - Stream Event Routing
+
+    /// Route un StreamEvent vers les parts du message assistant à l'index donné.
+    /// Appelé sur MainActor depuis la boucle de streaming.
+    private func handleStreamEvent(_ event: StreamEvent, at index: Int) {
+        guard messages.indices.contains(index) else { return }
+
+        switch event.type {
+        case .textDelta:
+            guard let content = event.content, !content.isEmpty else { return }
+            appendOrUpdateLastPart(type: .text, content: content, at: index)
+
+        case .reasoningDelta:
+            guard let content = event.content, !content.isEmpty else { return }
+            appendOrUpdateLastPart(type: .reasoning, content: content, at: index)
+
+        case .toolCallStart:
+            guard let id = event.toolCallId, let name = event.toolName else { return }
+            messages[index].parts.append(.toolCall(id: id, name: name))
+
+        case .toolCallResult:
+            guard let id = event.toolCallId, let content = event.content else { return }
+            // Mettre à jour la part toolCall correspondante si elle existe,
+            // sinon ajouter une part toolResult séparée
+            if let partIdx = messages[index].parts.firstIndex(where: {
+                $0.type == .toolCall && $0.toolCallId == id
+            }) {
+                messages[index].parts[partIdx] = MessagePart(
+                    type: .toolCall,
+                    content: content,
+                    toolCallId: id,
+                    toolName: messages[index].parts[partIdx].toolName
+                )
+            } else {
+                messages[index].parts.append(.toolResult(id: id, content: content))
+            }
+
+        case .start, .done, .error, .unknown:
+            break
+        }
+    }
+
+    /// Ajoute un delta au dernier part du type spécifié, ou crée un nouveau part
+    /// si le dernier part est d'un type différent (ex: passage texte → reasoning).
+    private func appendOrUpdateLastPart(type: MessagePart.PartType, content: String, at index: Int) {
+        if let lastIdx = messages[index].parts.indices.last,
+           messages[index].parts[lastIdx].type == type {
+            messages[index].parts[lastIdx].content =
+                (messages[index].parts[lastIdx].content ?? "") + content
+        } else {
+            messages[index].parts.append(MessagePart(type: type, content: content))
+        }
+    }
+
     // MARK: - Title Generation
 
-    /// Génère un titre court au 1er échange via POST /agent/title.
-    ///
-    /// Le frontend envoie uniquement le texte brut ; le backend gère le prompt engineering.
     private func generateTitleWithAI() async {
         guard messages.count == 3, !titleGenerated else { return }
-        let firstUserMessage = messages.first(where: { $0.role == .user })?.content ?? ""
+        let firstUserMessage = messages.first(where: { $0.role == .user })?.textContent ?? ""
         guard !firstUserMessage.isEmpty else { return }
 
         do {

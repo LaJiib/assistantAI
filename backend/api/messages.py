@@ -5,27 +5,40 @@ Prefix : /api/conversations/{conversation_id}/messages
 
 Endpoints :
   GET    /        → historique messages (system exclu) → 200 [MessageResponse]
-  POST   /        → envoyer message + génération → 201 {userMessage, assistantMessage}
-  POST   /stream  → envoyer message + génération SSE → stream chunks
+  POST   /stream  → envoyer message + génération SSE → stream d'événements typés
 
 Codes HTTP :
-  201  Created        — POST réussi
-  404  Not Found      — conversation_id inexistant
-  422  Unprocessable  — validation Pydantic (contenu vide)
+  200  OK                — GET réussi
+  404  Not Found         — conversation_id inexistant
+  422  Unprocessable     — validation Pydantic (contenu vide)
   503  Service Unavailable — agent non initialisé
-  500  Internal Error — erreur I/O ou génération inattendue
+  500  Internal Error    — erreur I/O ou génération inattendue
 
 Règles métier :
-  - Le message system (role=system) est stocké dans {uuid}.json mais EXCLU de GET /
+  - Le message system (ModelRequest avec SystemPromptPart seul) est EXCLU de GET /
   - Message user sauvegardé AVANT génération (pas de perte si crash)
   - Si génération échoue : message user conservé, pas de rollback
   - messageCount dans l'index = nombre de messages user+assistant (system exclu)
-  - Streaming : accumulation mémoire → save unique à la fin (dans finally)
-  - Génération via IrisAgent (Pydantic AI) — tool calling et raisonnement multi-étapes
+  - Streaming : accumulation mémoire → save unique dans finally
+  - Génération via iris_agent.run_stream_events() — tool calling et reasoning inclus
+
+Protocole SSE BFF :
+  data: {"type": "start"}
+  data: {"type": "textDelta",      "content": "..."}
+  data: {"type": "reasoningDelta", "content": "..."}
+  data: {"type": "toolCallStart",  "toolCallId": "...", "toolName": "..."}
+  data: {"type": "toolCallResult", "toolCallId": "...", "content": "..."}
+  data: {"type": "error",          "content": "..."}
+  data: {"type": "done"}
+  data: [DONE]
+
+Synchronisation des listes :
+  Conversation.messages et Conversation.message_meta sont des listes parallèles
+  (même longueur). Tout ajout à l'une doit être accompagné d'un ajout à l'autre
+  dans le même bloc lock pour garantir leur cohérence.
 
 Concurrence :
   - Lock par conversation_id : protège load→append→save contre requêtes simultanées
-  - Pour conversations distinctes : aucune contention
 """
 
 from __future__ import annotations
@@ -33,17 +46,28 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from itertools import zip_longest
 from typing import Dict, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from pydantic_ai.messages import ModelRequest, ModelResponse, SystemPromptPart, UserPromptPart, TextPart
+from pydantic_ai import AgentRunResultEvent
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
 from pydantic_ai.settings import ModelSettings
 
 from core.agent import IrisDeps, build_dynamic_system_prompt
-from models.conversation import Message, Role, _utcnow
+from core.sse_transformer import GemmaThinkingParser, parse_thinking_tags, transform_agent_event
+from models.conversation import MessageMeta, _utcnow
 from storage.json_manager import JSONManager
 
 logger = logging.getLogger(__name__)
@@ -54,8 +78,6 @@ router = APIRouter(
 )
 
 # ── Locks par conversation ─────────────────────────────────────────────────────
-# Protège contre les écritures concurrentes sur le même {uuid}.json.
-# Le meta-lock sérialise uniquement la création d'entrées dans le dict.
 
 _conv_locks: Dict[str, threading.Lock] = {}
 _conv_locks_meta = threading.Lock()
@@ -90,49 +112,42 @@ def get_max_generation_tokens(request: Request) -> int:
     return int(getattr(request.app.state, "max_generation_tokens", 512))
 
 
-def get_max_generation_temperature(request: Request) -> float:
-    return float(getattr(request.app.state, "max_generation_temperature", 0.3))
+def get_generation_temperature(request: Request) -> float:
+    return float(getattr(request.app.state, "generation_temperature", 0.3))
+
+
+def get_generation_top_p(request: Request) -> float:
+    return float(getattr(request.app.state, "generation_top_p", 0.0))
+
+
+def get_generation_top_k(request: Request) -> int:
+    return int(getattr(request.app.state, "generation_top_k", 0))
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class SendMessageRequest(BaseModel):
-    content:     str         = Field(..., min_length=1, max_length=32000,
-                                     description="Contenu du message utilisateur")
-    max_tokens:  int | None  = Field(None, gt=0, le=32768)
-    temperature: float | None = Field(None, ge=0.0, le=2.0)
-    options:     dict = Field(default_factory=dict)
+    content: str  = Field(..., min_length=1, max_length=32000)
+    options: dict = Field(default_factory=dict)
+
+
+class MessagePartResponse(BaseModel):
+    type:       str        # "text", "reasoning", "toolCall", "toolResult"
+    content:    str | None = None
+    toolCallId: str | None = None
+    toolName:   str | None = None
 
 
 class MessageResponse(BaseModel):
     id:        str
-    role:      str
-    content:   str
+    role:      str   # "user" ou "assistant"
+    parts:     List[MessagePartResponse]
     timestamp: str
-
-    @classmethod
-    def from_model(cls, msg: Message) -> "MessageResponse":
-        ts = msg.timestamp
-        from datetime import timezone
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return cls(
-            id=str(msg.id),
-            role=msg.role.value,
-            content=msg.content,
-            timestamp=ts.isoformat(),
-        )
-
-
-class SendMessageResponse(BaseModel):
-    userMessage:      MessageResponse
-    assistantMessage: MessageResponse
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_meta_or_404(conversation_id: str, jm: JSONManager):
-    """Charge métadonnées ou lève 404. load_index() effectue l'auto-cleanup."""
     index = jm.load_index()
     for meta in index:
         if meta.id.lower() == conversation_id.lower():
@@ -159,31 +174,54 @@ def _load_conversation_or_404(conversation_id: str, jm: JSONManager):
         )
 
 
-# L'historique prend l'objet deps riche
-def _build_message_history(conv, deps: IrisDeps) -> list:
-    history = []
-    
-    # 1. On demande au cerveau de construire le prompt parfait avec les deps
-    dynamic_prompt = build_dynamic_system_prompt(deps)
-    history.append(ModelRequest(parts=[SystemPromptPart(content=dynamic_prompt)]))
-    
-    # 2. On ajoute le dialogue (en ignorant l'ancien système BDD)
-    for msg in conv.messages:
-        if msg.role == Role.system:
-            continue
-        elif msg.role == Role.user:
-            history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
-        elif msg.role == Role.assistant:
-            history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
-            
-    return history
+def _model_message_to_response(
+    msg: ModelMessage,
+    meta: MessageMeta | None,
+) -> MessageResponse | None:
+    """
+    Convertit un ModelMessage Pydantic AI en MessageResponse lisible par le frontend.
+
+    - ModelRequest avec UserPromptPart → role=user, parts=[text]
+    - ModelRequest avec seulement SystemPromptPart/ToolReturnPart → None (filtré)
+    - ModelResponse → role=assistant, parts=[text?, toolCall*]
+    - Retourne None si aucune part visible.
+    """
+    ts = meta.timestamp.isoformat() if meta else _utcnow().isoformat()
+    msg_id = str(meta.id) if meta else str(UUID(int=0))
+
+    if isinstance(msg, ModelRequest):
+        parts: list[MessagePartResponse] = []
+        for part in msg.parts:
+            if isinstance(part, UserPromptPart):
+                content = part.content if isinstance(part.content, str) else str(part.content)
+                parts.append(MessagePartResponse(type="text", content=content))
+            # SystemPromptPart et ToolReturnPart : internes, non exposés
+        if not parts:
+            return None
+        return MessageResponse(id=msg_id, role="user", parts=parts, timestamp=ts)
+
+    elif isinstance(msg, ModelResponse):
+        parts = []
+        for part in msg.parts:
+            if isinstance(part, TextPart) and part.content:
+                # Parser les balises de réflexion Gemma stockées dans le texte brut
+                for part_type, content in parse_thinking_tags(part.content):
+                    parts.append(MessagePartResponse(type=part_type, content=content))
+            elif isinstance(part, ToolCallPart):
+                parts.append(MessagePartResponse(
+                    type="toolCall",
+                    toolCallId=part.tool_call_id,
+                    toolName=part.tool_name,
+                ))
+        if not parts:
+            return None
+        return MessageResponse(id=msg_id, role="assistant", parts=parts, timestamp=ts)
+
+    return None
 
 
 def _update_index_message_count(conversation_id: str, delta: int, jm: JSONManager) -> None:
-    """
-    Incrémente messageCount dans l'index sans relire depuis disk.
-    delta = nombre de messages ajoutés (1 si user seul, 2 si user+assistant).
-    """
+    """Incrémente messageCount dans l'index sans relire depuis disk."""
     index = jm.load_index()
     new_index = []
     for meta in index:
@@ -217,123 +255,149 @@ def _normalize_conversation_id(raw_id: str) -> str:
 @router.get(
     "/",
     response_model=List[MessageResponse],
-    summary="Historique des messages",
+    summary="Historique des messages (format multi-parts)",
 )
 def get_messages(
     conversation_id: str,
     jm: JSONManager = Depends(get_json_manager),
 ) -> List[MessageResponse]:
     """
-    Retourne les messages user et assistant, triés par timestamp.
-    Le message system (role=system) est exclu — c'est une métadonnée de config,
-    pas un message visible dans l'historique.
+    Retourne les messages user et assistant, triés par ordre d'insertion.
+    Les messages system (ModelRequest avec SystemPromptPart seul) sont exclus.
+    Chaque message contient un tableau de parts (text, toolCall, etc.).
     """
     conversation_id = _normalize_conversation_id(conversation_id)
     _get_meta_or_404(conversation_id, jm)
     conv = _load_conversation_or_404(conversation_id, jm)
 
-    visible = [m for m in conv.messages if m.role != Role.system]
-    visible.sort(key=lambda m: m.timestamp)
-    return [MessageResponse.from_model(m) for m in visible]
+    responses: list[MessageResponse] = []
+    for msg, meta in zip_longest(conv.messages, conv.message_meta):
+        r = _model_message_to_response(msg, meta)
+        if r is not None:
+            responses.append(r)
+    return responses
 
 
-
-@router.post("/stream", summary="Envoyer un message avec réponse en streaming SSE")
+@router.post("/stream", summary="Envoyer un message avec réponse en streaming SSE typé")
 async def send_message_stream(
     conversation_id: str,
     body: SendMessageRequest,
     jm: JSONManager = Depends(get_json_manager),
     iris_agent=Depends(get_iris_agent),
     max_generation_tokens: int = Depends(get_max_generation_tokens),
-    max_generation_temperature: float = Depends(get_max_generation_temperature),
+    generation_temperature: float = Depends(get_generation_temperature),
+    generation_top_p: float = Depends(get_generation_top_p),
+    generation_top_k: int = Depends(get_generation_top_k),
 ) -> StreamingResponse:
     """
-    Même workflow que POST / mais la réponse assistant est streamée via SSE.
+    Envoie un message et streame la réponse de l'agent via SSE.
 
-    Génération via iris_agent.run_stream() (Pydantic AI) — tool calling inclus.
+    Le backend agit comme BFF :
+    - Intercepte les balises de réflexion Gemma (<|channel>thought...<channel|>)
+    - Transforme les événements Pydantic AI en protocol SSE JSON propre
+    - Sauvegarde l'historique natif (ModelMessage) après le stream
 
-    Format SSE :
-        data: {"userMessage": {...}}\\n\\n  — confirmation message user (1er event)
-        data: {"text": "chunk"}\\n\\n       — token(s) générés
-        data: [DONE]\\n\\n                  — fin (messages sauvegardés)
-
-    Erreur pendant stream :
-        data: {"error": "message"}\\n\\n
-        data: [DONE]\\n\\n
-
-    Save strategy : accumulation mémoire → save unique dans finally.
-    Si le client déconnecte avant [DONE] : le texte partiel est quand même
-    sauvegardé pour éviter la perte de données.
+    Le client iOS est "dumb" : il ne renvoie pas d'historique, il consomme
+    uniquement les événements SSE typés.
     """
     conversation_id = _normalize_conversation_id(conversation_id)
-    effective_max_tokens = min(
-        body.max_tokens if body.max_tokens is not None else max_generation_tokens,
-        max_generation_tokens,
-    )
-    effective_temperature = min(
-        body.temperature if body.temperature is not None else max_generation_temperature,
-        max_generation_temperature,
-    )
-    meta =_get_meta_or_404(conversation_id, jm)
-
+    effective_max_tokens = max_generation_tokens
+    meta = _get_meta_or_404(conversation_id, jm)
     lock = _get_conv_lock(conversation_id)
 
     deps = IrisDeps(
-            enable_thinking=body.options.get("think", False),
-            conversation_system_prompt=meta.specificInstruction,
-            vector_store=None
-        )
+        enable_thinking=body.options.get("think", False),
+        conversation_system_prompt=meta.specificInstruction,
+        vector_store=None,
+    )
 
     async def sse_generator():
-        # 1. Création du message User en format natif Pydantic AI
+        # ── 1. Sauvegarder le message user AVANT de lancer la génération ──────
         user_request = ModelRequest(parts=[UserPromptPart(content=body.content)])
-        
         with lock:
             conv = _load_conversation_or_404(conversation_id, jm)
+            # Synchronisation atomique : on ajoute le message ET son méta ensemble
             conv.messages.append(user_request)
+            conv.message_meta.append(MessageMeta())
             jm.save_conversation(conv)
 
-        # On notifie le front que le processus démarre
-        yield f"data: {json.dumps({'event': 'start'})}\n\n"
+        yield f"data: {json.dumps({'type': 'start'})}\n\n"
 
-        settings = ModelSettings(max_tokens=effective_max_tokens, temperature=effective_temperature)
-        final_history = []
+        # ── 2. Construire l'historique pour Pydantic AI ────────────────────────
+        # Le system prompt est dynamique (dépend de IrisDeps) → on le recalcule
+        # à chaque requête et on le prepend à l'historique stocké.
+        # On passe conv.messages[:-1] car le user_request courant est passé
+        # séparément en tant que user_prompt de run_stream_events().
+        system_prompt = build_dynamic_system_prompt(deps)
+        history_for_agent: list[ModelMessage] = [
+            ModelRequest(parts=[SystemPromptPart(content=system_prompt)])
+        ] + list(conv.messages[:-1])
+
+        settings = ModelSettings(
+            max_tokens=effective_max_tokens,
+            temperature=generation_temperature,
+            top_p=generation_top_p,
+            top_k=generation_top_k,  # type: ignore[typeddict-unknown-key]
+        )
+
+        run_result = None
+        parser = GemmaThinkingParser()
 
         try:
-            # 2. Utilisation de la méthode recommandée pour TOUT capturer (Tools + Text)
-            # run_stream_events() retourne un flux asynchrone d'événements Pydantic AI
+            # ── 3. Itérer sur les événements Pydantic AI ──────────────────────
             async for event in iris_agent.run_stream_events(
                 body.content,
+                message_history=history_for_agent,
                 deps=deps,
-                message_history=conv.messages[:-1], # On passe l'historique sans le user_request qu'on vient d'ajouter (géré par Pydantic)
                 model_settings=settings,
             ):
-                # Chaque événement (RunEvent) est sérialisable en JSON
-                # Cela inclura les text_deltas, tool_calls, etc.
-                yield f"data: {event.model_dump_json()}\n\n"
+                # AgentRunResultEvent : n'est pas un AgentStreamEvent,
+                # on le capture pour récupérer new_messages() dans le finally
+                if isinstance(event, AgentRunResultEvent):
+                    run_result = event.result
+                    continue
+
+                # Transformer l'événement natif en 0-N dicts BFF
+                for bff_event in transform_agent_event(event, parser):
+                    yield f"data: {json.dumps(bff_event)}\n\n"
+
+            # Vider le buffer résiduel du parser Gemma
+            for event_type, content in parser.flush():
+                if content:
+                    yield f"data: {json.dumps({'type': event_type, 'content': content})}\n\n"
 
         except Exception as exc:
-            logger.error("Erreur stream [%s] : %s", conversation_id, exc)
-            yield f"data: {json.dumps({'event': 'error', 'detail': str(exc)})}\n\n"
+            logger.error("Erreur stream [%s] : %s", conversation_id, exc, exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'content': str(exc)})}\n\n"
 
         finally:
-            # 3. Récupération FIABLE de l'état final
-            # Pydantic AI recommande de récupérer le résultat de run() ou les new_messages
-            # Pour s'assurer de ne rien perdre (cf. le warning de la doc)
-            with lock:
+            # ── 4. Sauvegarder les nouveaux messages de l'agent ───────────────
+            # run_result.new_messages() retourne [user_request, *agent_responses]
+            # new_messages()[0] = le user_request déjà sauvegardé → on skip
+            if run_result is not None:
                 try:
-                    # On recharge pour éviter d'écraser des données en cas de concurrence
-                    conv_final = _load_conversation_or_404(conversation_id, jm)
-                    
-                    # NOTE : Selon la version exacte de Pydantic AI, run_stream_events() 
-                    # met à jour un objet RunResult ou fournit un moyen d'extraire les new_messages().
-                    # Si vous utilisez un agent classique, on peut simplement concaténer 
-                    # les événements ModelMessage complétés capturés durant le stream.
-                    
-                    jm.save_conversation(conv_final)
-                except Exception as save_exc:
-                    logger.error("Erreur save post-stream : %s", save_exc)
+                    new_msgs = run_result.new_messages()
+                    agent_msgs = new_msgs[1:]  # On exclut le user_request initial
 
+                    if agent_msgs:
+                        with lock:
+                            conv_final = _load_conversation_or_404(conversation_id, jm)
+                            for msg in agent_msgs:
+                                # Synchronisation atomique : message ET méta ensemble
+                                conv_final.messages.append(msg)
+                                conv_final.message_meta.append(MessageMeta())
+                            jm.save_conversation(conv_final)
+                            # +1 user (déjà compté) + len(agent_msgs) nouvelles entrées
+                            _update_index_message_count(conversation_id, len(agent_msgs), jm)
+                except Exception as save_exc:
+                    logger.error("Erreur save post-stream [%s]: %s", conversation_id, save_exc)
+            else:
+                logger.warning(
+                    "Stream [%s] : run_result est None — réponse assistant non sauvegardée",
+                    conversation_id,
+                )
+
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse_generator(), media_type="text/event-stream")

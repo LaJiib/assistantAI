@@ -5,98 +5,79 @@
 //  Created by JB SENET on 01/02/2026.
 //
 
-import AVKit
+import MarkdownUI
 import SwiftUI
 
 
-enum ContentSegment {
-    case text(String)
-    case code(String, language: String?)
-}
+// MARK: - Custom Markdown Theme
 
-extension String {
-    /// Découpe une chaîne en segments alternant texte normal et blocs de code fencés.
-    /// Les blocs de code sont délimités par ``` (optionnellement suivis d'un nom de langage).
-    func parsedSegments() -> [ContentSegment] {
-        var segments: [ContentSegment] = []
-        var remaining = self[self.startIndex...]
-        
-        while let openRange = remaining.range(of: "```") {
-            // Texte avant le bloc de code
-            let textBefore = String(remaining[remaining.startIndex..<openRange.lowerBound])
-            if !textBefore.isEmpty {
-                segments.append(.text(textBefore))
-            }
-            
-            // Avancer après le ```
-            let afterOpen = remaining[openRange.upperBound...]
-            
-            // Chercher le ``` de fermeture
-            guard let closeRange = afterOpen.range(of: "```") else {
-                // Pas de fermeture trouvée — le reste est du code (bloc non fermé)
-                segments.append(.code(String(afterOpen), language: nil))
-                remaining = remaining[remaining.endIndex...]
-                break
-            }
-            
-            // Extraire le contenu entre les deux ```
-            let codeContent = String(afterOpen[afterOpen.startIndex..<closeRange.lowerBound])
-            
-            // Le premier mot de la première ligne peut être le nom du langage
-            let lines = codeContent.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-            var language: String? = nil
-            var actualCode = codeContent
-            
-            if let firstLine = lines.first {
-                let candidate = String(firstLine).trimmingCharacters(in: .whitespaces)
-                if !candidate.isEmpty && !candidate.contains(" ") {
-                    // C'est un mot seul sur la première ligne = nom du langage
-                    language = candidate
-                    // Le code commence après cette première ligne
-                    actualCode = lines.count > 1 ? String(lines[1]) : ""
+extension Theme {
+    static let assistant = Theme()
+        // ── Titres ────────────────────────────────────────────────────────────
+        .heading1 { configuration in
+            configuration.label
+                .markdownMargin(top: 20, bottom: 6)
+                .markdownTextStyle {
+                    FontWeight(.bold)
+                    FontSize(.em(1.5))
                 }
+        }
+        .heading2 { configuration in
+            configuration.label
+                .markdownMargin(top: 16, bottom: 4)
+                .markdownTextStyle {
+                    FontWeight(.semibold)
+                    FontSize(.em(1.2))
+                }
+        }
+        .heading3 { configuration in
+            configuration.label
+                .markdownMargin(top: 12, bottom: 2)
+                .markdownTextStyle {
+                    FontWeight(.semibold)
+                    FontSize(.em(1.05))
+                }
+        }
+        // ── Emphases ──────────────────────────────────────────────────────────
+        .strong {
+            FontWeight(.bold)
+        }
+        .emphasis {
+            FontStyle(.italic)
+            ForegroundColor(.primary.opacity(0.75))
+        }
+        // ── Code inline ───────────────────────────────────────────────────────
+        .code {
+            FontFamilyVariant(.monospaced)
+            FontSize(.em(0.85))
+            ForegroundColor(.secondary)
+        }
+        // ── Blocs de code ─────────────────────────────────────────────────────
+        .codeBlock { configuration in
+            ScrollView(.horizontal) {
+                configuration.label
+                    .relativeLineSpacing(.em(0.25))
+                    .markdownTextStyle {
+                        FontFamilyVariant(.monospaced)
+                        FontSize(.em(0.85))
+                        ForegroundColor(.secondary)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            
-            segments.append(.code(actualCode, language: language))
-            
-            // Avancer après le ``` de fermeture
-            remaining = afterOpen[closeRange.upperBound...]
+            .background(.background.secondary)
+            .clipShape(.rect(cornerRadius: 8))
         }
-        
-        // Texte restant après le dernier bloc de code
-        let lastText = String(remaining)
-        if !lastText.isEmpty {
-            segments.append(.text(lastText))
-        }
-        
-        // Si aucun segment n'a été créé (pas de ``` du tout), retourner le texte entier
-        if segments.isEmpty {
-            segments.append(.text(self))
-        }
-        
-        return segments
-    }
 }
 
-extension ContentSegment: CustomStringConvertible {
-    var description: String {
-        switch self {
-        case .text(let text):
-            return "text:\(text.prefix(50))"
-        case .code(let code, let language):
-            return "code:\(language ?? "unknown"):\(code.prefix(50))"
-        }
-    }
-}
 
-/// A view that displays a single message in the chat interface.
-/// Supports different message roles (user, assistant, system) and media attachments.
+// MARK: - MessageView
+
+/// Affiche un message unique dans l'interface de chat.
+/// Itère sur `message.parts` pour rendre texte, raisonnement et appels d'outils.
 struct MessageView: View {
-    /// The message to be displayed
     let message: Message
 
-    /// Creates a message view
-    /// - Parameter message: The message model to display
     init(_ message: Message) {
         self.message = message
     }
@@ -104,13 +85,10 @@ struct MessageView: View {
     var body: some View {
         switch message.role {
         case .user:
-            // User messages are right-aligned with blue background
             HStack {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 8) {
-                    // Message content with tinted background.
-                    // LocalizedStringKey used to trigger default handling of markdown content.
-                    Text(LocalizedStringKey(message.content))
+                    Text(LocalizedStringKey(message.textContent))
                         .padding(.vertical, 8)
                         .padding(.horizontal, 12)
                         .background(.tint, in: .rect(cornerRadius: 16))
@@ -121,32 +99,15 @@ struct MessageView: View {
         case .assistant:
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(message.content.parsedSegments(), id: \.description) { segment in
-                        switch segment {
-                        case .text(let text):
-                            Text(LocalizedStringKey(text))
-                                .textSelection(.enabled)
-                                
-                        case .code(let code, _):
-                            ScrollView(.horizontal) {
-                                Text(code)
-                                    .font(.system(size: 13, weight: .regular, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .padding(12)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .textSelection(.enabled)
-                            }
-                            .background(.background.secondary)
-                            .clipShape(.rect(cornerRadius: 8))
-                        }
+                    ForEach(Array(message.parts.enumerated()), id: \.offset) { _, part in
+                        AssistantPartView(part: part)
                     }
                 }
                 Spacer()
             }
 
-        case .system:
-            // System messages are centered with computer icon
-            Label(message.content, systemImage: "desktopcomputer")
+        case .system, .tool:
+            Label(message.textContent, systemImage: "desktopcomputer")
                 .font(.headline)
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -155,6 +116,68 @@ struct MessageView: View {
 }
 
 
+// MARK: - AssistantPartView
+
+/// Rendu d'une part individuelle d'un message assistant.
+private struct AssistantPartView: View {
+    let part: MessagePart
+
+    var body: some View {
+        switch part.type {
+
+        // ── Texte standard : rendu Markdown complet ──────────────────────────
+        case .text:
+            Markdown(part.content ?? "")
+                .markdownTheme(.assistant)
+                .textSelection(.enabled)
+
+        // ── Raisonnement : DisclosureGroup discret, replié par défaut ───────────
+        case .reasoning:
+            DisclosureGroup {
+                Text(part.content ?? "")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 4)
+            } label: {
+                Label("Réflexion", systemImage: "brain")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(8)
+            .background(.background.secondary, in: .rect(cornerRadius: 8))
+
+        // ── Appel d'outil : indicateur de chargement ou résultat ───────────────
+        case .toolCall:
+            HStack(spacing: 6) {
+                if part.content == nil {
+                    // Outil en cours d'exécution
+                    ProgressView()
+                        .scaleEffect(0.75)
+                        .frame(width: 14, height: 14)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .imageScale(.small)
+                }
+                Text(part.toolName ?? "Outil")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 8)
+            .background(.background.secondary, in: .rect(cornerRadius: 6))
+
+        // ── Résultat d'outil : masqué (fusionné dans la part toolCall) ──────────
+        case .toolResult:
+            EmptyView()
+        }
+    }
+}
+
+
+// MARK: - Previews
 
 #Preview {
     VStack(spacing: 20) {
@@ -170,7 +193,20 @@ struct MessageView: View {
                 return f"Bonjour, {name} !"
 
             print(greet("Alice"))
-        """))
+            ```
+            """))
+
+        // Message avec raisonnement + outil
+        MessageView(Message(
+            id: UUID(),
+            role: .assistant,
+            parts: [
+                .reasoning("Je dois d'abord chercher les informations pertinentes..."),
+                .toolCall(id: "tc1", name: "web_search"),
+                .text("## Résultat\n\nD'après mes recherches, voici la **réponse**.")
+            ],
+            timestamp: Date()
+        ))
     }
     .padding()
 }

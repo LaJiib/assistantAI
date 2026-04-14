@@ -26,39 +26,24 @@ final class ChatAPI {
         config.waitsForConnectivity = false      // échouer immédiatement si backend down
         self.session = URLSession(configuration: config)
     }
-
+    struct StreamEvent: Decodable {
+        let type: String       // "start", "textDelta", "toolCall", "done", "error"
+        let content: String?
+        let toolName: String?
+        let toolCallId: String?
+        let errorMessage: String?
+    }
+    
     // MARK: - Private: SSE Parser
-
-    private func handleSSELine(
-        _ line: String,
-        continuation: AsyncThrowingStream<String, Error>.Continuation
-    ) {
-        // SSE : ignorer lignes vides et commentaires
+    private func handleSSELine(_ line: String, continuation: AsyncThrowingStream<StreamEvent, Error>.Continuation) {
         guard line.hasPrefix("data: ") else { return }
         let payload = String(line.dropFirst(6))
-
-        // Fin de stream
-        guard payload != "[DONE]" else {
-            continuation.finish()
-            return
-        }
-
-        // Décodage JSON {"text": "..."} ou {"error": "..."}
-        guard let data = payload.data(using: .utf8) else {
-            continuation.finish(throwing: ChatAPIError.decodingError("Ligne SSE non-UTF8"))
-            return
-        }
-
-        do {
-            let chunk = try JSONDecoder().decode(SSEChunk.self, from: data)
-            if let errorMsg = chunk.error {
-                continuation.finish(throwing: ChatAPIError.streamError(errorMsg))
-            } else if let text = chunk.text {
-                continuation.yield(text)
-            }
-        } catch {
-            continuation.finish(throwing: ChatAPIError.decodingError("JSON invalide : \(payload)"))
-        }
+        if payload == "[DONE]" { continuation.finish(); return }
+        
+        guard let data = payload.data(using: .utf8),
+              let event = try? JSONDecoder().decode(StreamEvent.self, from: data) else { return }
+        
+        continuation.yield(event)
     }
 
     // MARK: - Private: HTTP Helpers

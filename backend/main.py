@@ -25,6 +25,7 @@ from api.conversations import router as conversations_router
 from api.messages import router as messages_router
 from storage.json_manager import JSONManager
 from tools import register_builtin_tools
+from tools.builtin.web import fetch_webpage, web_search
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +34,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# Construit le chemin absolu vers le .env (situé à côté de main.py)
+env_path = Path(__file__).parent / ".env"
+
+# Le paramètre override=True force l'écrasement au cas où une variable vide traînerait
+load_dotenv(dotenv_path=env_path, override=True)
 
 MODEL_PATH = os.getenv("MODEL_PATH", "")
 HOST       = os.getenv("HOST", "127.0.0.1")
@@ -44,13 +49,18 @@ MAX_GENERATION_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "512"))
 if MAX_GENERATION_TOKENS <= 0:
     logger.warning("MAX_GENERATION_TOKENS invalide (%s), fallback à 512", MAX_GENERATION_TOKENS)
     MAX_GENERATION_TOKENS = 512
-MAX_GENERATION_TEMPERATURE = float(os.getenv("MAX_GENERATION_TEMPERATURE", "0.3"))
-if MAX_GENERATION_TEMPERATURE < 0.0 or MAX_GENERATION_TEMPERATURE > 2.0:
-    logger.warning(
-        "MAX_GENERATION_TEMPERATURE invalide (%s), fallback à 0.3",
-        MAX_GENERATION_TEMPERATURE,
-    )
-    MAX_GENERATION_TEMPERATURE = 0.3
+GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.3"))
+if not (0.0 <= GENERATION_TEMPERATURE <= 2.0):
+    logger.warning("GENERATION_TEMPERATURE invalide (%s), fallback à 0.3", GENERATION_TEMPERATURE)
+    GENERATION_TEMPERATURE = 0.3
+GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.0"))
+if not (0.0 <= GENERATION_TOP_P <= 1.0):
+    logger.warning("GENERATION_TOP_P invalide (%s), fallback à 0.0", GENERATION_TOP_P)
+    GENERATION_TOP_P = 0.0
+GENERATION_TOP_K = int(os.getenv("GENERATION_TOP_K", "0"))
+if GENERATION_TOP_K < 0:
+    logger.warning("GENERATION_TOP_K invalide (%s), fallback à 0", GENERATION_TOP_K)
+    GENERATION_TOP_K = 0
 
 
 def _resolve_tools_folder() -> Path:
@@ -76,7 +86,7 @@ def _resolve_tools_folder() -> Path:
 class ChatRequest(BaseModel):
     prompt:      str   = Field(..., min_length=1)
     max_tokens:  int   = Field(MAX_GENERATION_TOKENS, gt=0, le=32768)
-    temperature: float = Field(MAX_GENERATION_TEMPERATURE, ge=0.0, le=2.0)
+    temperature: float = Field(GENERATION_TEMPERATURE, ge=0.0, le=2.0)
 
 class ChatResponse(BaseModel):
     response: str
@@ -85,7 +95,7 @@ class AgentChatRequest(BaseModel):
     """Requête pour l'endpoint agent — utilise IrisAgent (Pydantic AI)."""
     message:     str   = Field(..., min_length=1, description="Message utilisateur")
     max_tokens:  int   = Field(MAX_GENERATION_TOKENS, gt=0, le=32768)
-    temperature: float = Field(MAX_GENERATION_TEMPERATURE, ge=0.0, le=2.0)
+    temperature: float = Field(GENERATION_TEMPERATURE, ge=0.0, le=2.0)
 
 class AgentChatResponse(BaseModel):
     response: str
@@ -130,8 +140,10 @@ async def lifespan(app: FastAPI):
     app.state.model_loading = False
     app.state.model_error = None
     app.state.model_task = None
-    app.state.max_generation_tokens = MAX_GENERATION_TOKENS
-    app.state.max_generation_temperature = MAX_GENERATION_TEMPERATURE
+    app.state.max_generation_tokens   = MAX_GENERATION_TOKENS
+    app.state.generation_temperature  = GENERATION_TEMPERATURE
+    app.state.generation_top_p        = GENERATION_TOP_P
+    app.state.generation_top_k        = GENERATION_TOP_K
 
     if not MODEL_PATH:
         app.state.model_error = "MODEL_PATH non défini"
@@ -144,8 +156,11 @@ async def lifespan(app: FastAPI):
                 engine = IrisEngine(model_path=MODEL_PATH)
                 await engine.load()
                 app.state.engine = engine
-                # Créer l'agent Pydantic AI une fois le moteur chargé
-                app.state.iris_agent = create_iris_agent(engine)
+                # Créer l'agent Pydantic AI une fois le moteur chargé (Étape 3 : web tools)
+                app.state.iris_agent = create_iris_agent(
+                    engine,
+                    tools=[web_search, fetch_webpage],
+                )
                 logger.info("✅ Iris prête : %s", engine.model_name)
             except Exception as exc:
                 app.state.model_error = str(exc)
@@ -157,7 +172,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("📡 Écoute sur http://%s:%d", HOST, PORT)
     logger.info("🧰 tools_registry=%s", tools_folder)
-    logger.info("⚙️  max_tokens=%d  temperature=%.2f", MAX_GENERATION_TOKENS, MAX_GENERATION_TEMPERATURE)
+    logger.info(
+        "⚙️  max_tokens=%d  temperature=%.2f  top_p=%.2f  top_k=%d",
+        MAX_GENERATION_TOKENS, GENERATION_TEMPERATURE, GENERATION_TOP_P, GENERATION_TOP_K,
+    )
 
     try:
         yield
@@ -216,7 +234,7 @@ async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
         from pydantic_ai.settings import ModelSettings
         settings = ModelSettings(
             max_tokens=min(request.max_tokens, int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))),
-            temperature=min(request.temperature, float(getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE))),
+            temperature=min(request.temperature, float(getattr(app.state, "max_generation_temperature", GENERATION_TEMPERATURE))),
         )
         result = await iris_agent.run(
             request.message,
@@ -243,7 +261,7 @@ def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
     engine: IrisEngine | None = getattr(app.state, "engine", None)
     max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
     max_generation_temperature: float = float(
-        getattr(app.state, "max_generation_temperature", MAX_GENERATION_TEMPERATURE)
+        getattr(app.state, "max_generation_temperature", GENERATION_TEMPERATURE)
     )
     if not engine or not engine.is_loaded:
         raise HTTPException(status_code=503, detail="Modèle non chargé.")

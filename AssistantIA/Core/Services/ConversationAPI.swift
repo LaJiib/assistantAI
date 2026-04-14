@@ -59,6 +59,27 @@ enum ConversationAPIError: LocalizedError {
     }
 }
 
+// MARK: - Stream Events (protocole BFF)
+
+/// Événement typé émis par le backend SSE.
+/// Le client consomme ces événements pour construire le message assistant en temps réel.
+struct StreamEvent {
+    enum EventType: String {
+        case start
+        case textDelta
+        case reasoningDelta
+        case toolCallStart
+        case toolCallResult
+        case error
+        case done
+        case unknown
+    }
+    let type: EventType
+    var content: String?
+    var toolCallId: String?
+    var toolName: String?
+}
+
 // MARK: - Private API response types
 // DTO réseau (contrat backend) séparés des modèles métier Swift.
 
@@ -68,37 +89,47 @@ private enum APIRole: String, Decodable {
     case system
 }
 
+/// Part d'un message tel que retourné par GET /messages/
+private struct APIMessagePart: Decodable {
+    let type:       String
+    let content:    String?
+    let toolCallId: String?
+    let toolName:   String?
+}
+
 private struct APIMessage: Decodable {
-    let id: UUID
-    let role: APIRole
-    let content: String
+    let id:        UUID
+    let role:      APIRole
+    let parts:     [APIMessagePart]
     let timestamp: Date
 }
 
 private struct APIConversation: Decodable {
-    let id: UUID
+    let id:       UUID
     let messages: [APIMessage]
 }
 
 private struct APIConversationMetadata: Decodable {
-    let id: UUID
-    let title: String
-    let createdAt: Date
-    let updatedAt: Date
-    let messageCount: Int
+    let id:                  UUID
+    let title:               String
+    let createdAt:           Date
+    let updatedAt:           Date
+    let messageCount:        Int
     let specificInstruction: String?
 }
 
 private struct APISendMessageResponse: Decodable {
-    let userMessage: APIMessage
+    let userMessage:      APIMessage
     let assistantMessage: APIMessage
 }
 
-/// Chunk SSE — {"text":"..."}, {"error":"..."} ou {"userMessage":{...}}
-private struct SSEChunk: Decodable {
-    let text:        String?
-    let error:       String?
-    // Premier event du stream : userMessage inclus (ignoré dans le stream texte)
+/// Enveloppe brute d'un event SSE BFF — décodage du JSON dans la ligne "data: ..."
+private struct RawSSEEvent: Decodable {
+    let type:       String?
+    let content:    String?
+    let toolCallId: String?
+    let toolName:   String?
+    let error:      String?   // Pour la rétrocompatibilité éventuelle
 }
 
 // MARK: - Request bodies
@@ -114,9 +145,8 @@ private struct UpdateConversationBody: Encodable {
 
 private struct SendMessageBody: Encodable {
     let content:     String
-    let max_tokens:  Int?
     let temperature: Float?
-    let options: [String: Bool]?
+    let options:     [String: Bool]?
 }
 
 // MARK: - ConversationAPI
@@ -193,6 +223,7 @@ actor ConversationAPI {
     // MARK: - Messages
 
     /// GET /api/conversations/{id}/messages/ → historique user+assistant (system exclu).
+    /// Chaque message contient un tableau de parts (text, reasoning, toolCall…).
     func getMessages(conversationID: UUID) async throws -> [Message] {
         let path = "/api/conversations/\(conversationID)/messages/"
         let request = makeRequest(method: "GET", path: path)
@@ -207,7 +238,6 @@ actor ConversationAPI {
         conversationID: UUID,
         content: String,
         options: [String: Bool]? = nil,
-        maxTokens: Int? = nil,
         temperature: Float? = nil
     ) async throws -> (user: Message, assistant: Message) {
         var request = makeRequest(
@@ -216,7 +246,6 @@ actor ConversationAPI {
         )
         request.httpBody = try encoder.encode(SendMessageBody(
             content: content,
-            max_tokens: maxTokens,
             temperature: temperature,
             options: options
         ))
@@ -225,24 +254,27 @@ actor ConversationAPI {
         return (toDomain(resp.userMessage), toDomain(resp.assistantMessage))
     }
 
-    /// POST /api/conversations/{id}/messages/stream → stream SSE de chunks texte.
+    /// POST /api/conversations/{id}/messages/stream → stream SSE d'événements typés.
     ///
     /// Utilisation :
     /// ```swift
-    /// for try await chunk in api.sendMessage(conversationID: id, content: "Bonjour") {
-    ///     text += chunk
+    /// for try await event in api.sendMessage(conversationID: id, content: "Bonjour") {
+    ///     switch event.type {
+    ///     case .textDelta: accumuler event.content
+    ///     case .reasoningDelta: afficher en DisclosureGroup
+    ///     case .toolCallStart: montrer un indicateur de chargement
+    ///     ...
+    ///     }
     /// }
     /// ```
     ///
     /// Annulation : `Task.cancel()` ferme la connexion HTTP.
-    /// Le backend sauvegarde alors le texte partiel accumulé.
     nonisolated func sendMessage(
         conversationID: UUID,
         content: String,
         options: [String: Bool]? = nil,
-        maxTokens: Int? = nil,
         temperature: Float? = nil
-    ) -> AsyncThrowingStream<String, Error> {
+    ) -> AsyncThrowingStream<StreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -256,16 +288,9 @@ actor ConversationAPI {
                     request.timeoutInterval = 60
                     request.httpBody = try JSONEncoder().encode(SendMessageBody(
                         content: content,
-                        max_tokens: maxTokens,
                         temperature: temperature,
                         options: options
                     ))
-
-                    if let bodyData = request.httpBody, let jsonString = String(data: bodyData, encoding: .utf8) {
-                        print("[ConversationAPI] PAYLOAD EXACT ENVOYÉ : \(jsonString)")
-                    } else {
-                        print("[ConversationAPI] Impossible de lire le payload HTTP.")
-                    }
 
                     let config = URLSessionConfiguration.default
                     config.timeoutIntervalForRequest  = 60
@@ -276,11 +301,14 @@ actor ConversationAPI {
                     let (bytes, response) = try await streamSession.bytes(for: request)
                     try Self.validateHTTPResponse(response, data: nil)
 
+                    let decoder = JSONDecoder()
+
                     for try await line in bytes.lines {
                         try Task.checkCancellation()
                         guard line.hasPrefix("data: ") else { continue }
                         let payload = String(line.dropFirst(6))
 
+                        // [DONE] n'est PAS du JSON — intercepter avant tout décodage
                         if payload == "[DONE]" {
                             continuation.finish()
                             return
@@ -288,16 +316,27 @@ actor ConversationAPI {
 
                         guard let raw = payload.data(using: .utf8) else { continue }
 
-                        // Décoder uniquement text/error, ignorer userMessage du premier event
-                        if let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
-                            if let errorMsg = json["error"] as? String {
-                                continuation.finish(throwing: ConversationAPIError.streamError(errorMsg))
-                                return
-                            }
-                            if let text = json["text"] as? String {
-                                continuation.yield(text)
-                            }
-                            // json["userMessage"] → ignoré dans le stream texte
+                        guard let evt = try? decoder.decode(RawSSEEvent.self, from: raw) else { continue }
+
+                        let eventType = StreamEvent.EventType(rawValue: evt.type ?? "") ?? .unknown
+
+                        switch eventType {
+                        case .error:
+                            let msg = evt.content ?? evt.error ?? "Erreur inconnue"
+                            continuation.finish(throwing: ConversationAPIError.streamError(msg))
+                            return
+                        case .done:
+                            // Le backend émet {"type":"done"} puis [DONE] — on attend [DONE]
+                            continue
+                        case .start, .unknown:
+                            continue
+                        default:
+                            continuation.yield(StreamEvent(
+                                type: eventType,
+                                content: evt.content,
+                                toolCallId: evt.toolCallId,
+                                toolName: evt.toolName
+                            ))
                         }
                     }
 
@@ -314,7 +353,6 @@ actor ConversationAPI {
                 }
             }
 
-            // Propager la cancellation du stream vers la URLSession task
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -388,11 +426,21 @@ actor ConversationAPI {
         }
     }
 
+    private func toDomain(_ part: APIMessagePart) -> MessagePart {
+        let partType = MessagePart.PartType(rawValue: part.type) ?? .text
+        return MessagePart(
+            type: partType,
+            content: part.content,
+            toolCallId: part.toolCallId,
+            toolName: part.toolName
+        )
+    }
+
     private func toDomain(_ message: APIMessage) -> Message {
         Message(
             id: message.id,
             role: toDomain(message.role),
-            content: message.content,
+            parts: message.parts.map(toDomain),
             timestamp: message.timestamp
         )
     }

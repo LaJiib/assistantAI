@@ -148,31 +148,153 @@ private struct AssistantPartView: View {
             .padding(8)
             .background(.background.secondary, in: .rect(cornerRadius: 8))
 
-        // ── Appel d'outil : indicateur de chargement ou résultat ───────────────
+        // ── Appel d'outil : badge de chargement ou aperçu du résultat ──────────
         case .toolCall:
-            HStack(spacing: 6) {
-                if part.content == nil {
-                    // Outil en cours d'exécution
-                    ProgressView()
-                        .scaleEffect(0.75)
-                        .frame(width: 14, height: 14)
-                } else {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                        .imageScale(.small)
-                }
-                Text(part.toolName ?? "Outil")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
-            .background(.background.secondary, in: .rect(cornerRadius: 6))
+            ToolCallView(part: part)
 
         // ── Résultat d'outil : masqué (fusionné dans la part toolCall) ──────────
         case .toolResult:
             EmptyView()
         }
+    }
+}
+
+
+// MARK: - ToolCallView
+
+/// Rendu adaptatif d'un appel d'outil :
+///   • En cours     → spinner + nom
+///   • Complété sans preview  → checkmark + nom
+///   • searchResults preview  → DisclosureGroup avec liste titre/URL
+///   • webpage preview        → DisclosureGroup avec URL + nb mots
+private struct ToolCallView: View {
+    let part: MessagePart
+    @State private var isExpanded = false
+
+    private var isCompleted: Bool { part.isCompleted == true }
+
+    var body: some View {
+        Group {
+            if !isCompleted {
+                loadingBadge
+            } else if let preview = part.preview, preview.previewType == "searchResults" {
+                searchResultsPreview(preview)
+            } else if let preview = part.preview, preview.previewType == "webpage" {
+                webpagePreview(preview)
+            } else {
+                completedBadge
+            }
+        }
+    }
+
+    // ── Spinner (outil en cours) ─────────────────────────────────────────────
+    private var loadingBadge: some View {
+        Label {
+            Text(part.toolName ?? "Outil")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+        } icon: {
+            ProgressView()
+                .scaleEffect(0.65)
+                .frame(width: 12, height: 12)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 6)
+        .background(.background.secondary, in: .rect(cornerRadius: 6))
+    }
+
+    // ── Checkmark simple (complété, pas de preview) ──────────────────────────
+    private var completedBadge: some View {
+        Label {
+            Text(part.toolName ?? "Outil")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+        } icon: {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .imageScale(.small)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 6)
+        .background(.background.secondary, in: .rect(cornerRadius: 6))
+    }
+
+    // ── Résultats de recherche ───────────────────────────────────────────────
+    @ViewBuilder
+    private func searchResultsPreview(_ preview: ToolPreview) -> some View {
+        let results = preview.results ?? []
+        let n = preview.count ?? results.count
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(results.enumerated()), id: \.offset) { idx, result in
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(result.title)
+                            .font(.caption2)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text(result.url)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                    .padding(.vertical, 3)
+                    if idx < results.count - 1 { Divider() }
+                }
+            }
+            .padding(.top, 2)
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .imageScale(.small)
+                Text(part.toolName ?? "Outil")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(n) résultat\(n > 1 ? "s" : "")")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(6)
+        .background(.background.secondary, in: .rect(cornerRadius: 8))
+    }
+
+    // ── Aperçu page web ──────────────────────────────────────────────────────
+    @ViewBuilder
+    private func webpagePreview(_ preview: ToolPreview) -> some View {
+        let urlString = preview.url ?? ""
+        let host = URL(string: urlString)?.host ?? urlString
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(urlString)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(2)
+                if let wc = preview.wordCount {
+                    Text("\(wc.formatted()) mots\(preview.truncated == true ? " · tronqué" : "")")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.top, 2)
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .imageScale(.small)
+                Text(part.toolName ?? "Outil")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(host)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(6)
+        .background(.background.secondary, in: .rect(cornerRadius: 8))
     }
 }
 
@@ -196,14 +318,46 @@ private struct AssistantPartView: View {
             ```
             """))
 
-        // Message avec raisonnement + outil
+        // Tool call en cours
         MessageView(Message(
-            id: UUID(),
-            role: .assistant,
+            id: UUID(), role: .assistant,
+            parts: [.toolCall(id: "tc1", name: "web_search")],
+            timestamp: Date()
+        ))
+
+        // Tool call complété avec résultats de recherche
+        MessageView(Message(
+            id: UUID(), role: .assistant,
             parts: [
-                .reasoning("Je dois d'abord chercher les informations pertinentes..."),
-                .toolCall(id: "tc1", name: "web_search"),
-                .text("## Résultat\n\nD'après mes recherches, voici la **réponse**.")
+                MessagePart(
+                    type: .toolCall, content: nil, toolCallId: "tc2", toolName: "web_search",
+                    preview: ToolPreview(
+                        previewType: "searchResults", query: "pydantic ai", count: 3,
+                        results: [
+                            SearchResultItem(title: "Pydantic AI Docs", url: "https://ai.pydantic.dev"),
+                            SearchResultItem(title: "GitHub — pydantic/pydantic-ai", url: "https://github.com/pydantic/pydantic-ai"),
+                        ],
+                        url: nil, wordCount: nil, truncated: nil
+                    ),
+                    isCompleted: true
+                ),
+                .text("D'après mes recherches, voici la **réponse**.")
+            ],
+            timestamp: Date()
+        ))
+
+        // Tool call fetch_webpage complété
+        MessageView(Message(
+            id: UUID(), role: .assistant,
+            parts: [
+                MessagePart(
+                    type: .toolCall, content: nil, toolCallId: "tc3", toolName: "fetch_webpage",
+                    preview: ToolPreview(
+                        previewType: "webpage", query: nil, count: nil, results: nil,
+                        url: "https://ai.pydantic.dev/agents/", wordCount: 2_341, truncated: false
+                    ),
+                    isCompleted: true
+                ),
             ],
             timestamp: Date()
         ))

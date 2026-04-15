@@ -3,21 +3,21 @@ sse_transformer.py — Transformateur d'événements Pydantic AI → SSE BFF.
 
 Rôle : agir comme couche de traduction entre les événements natifs de Pydantic AI
 et le protocole SSE JSON exposé au client iOS. Le client ne reçoit jamais
-d'événements Pydantic AI bruts, ni de balises de réflexion Gemma.
+d'événements Pydantic AI bruts.
 
 Protocole SSE BFF émis :
   {"type": "textDelta",      "content": "..."}
   {"type": "reasoningDelta", "content": "..."}
   {"type": "toolCallStart",  "toolCallId": "...", "toolName": "..."}
-  {"type": "toolCallResult", "toolCallId": "...", "content": "..."}
+  {"type": "toolCallResult", "toolCallId": "...", "preview": {...}}  # preview optionnel
 
-Gemma 4 signale son raisonnement avec les balises :
-  OPEN  : <|channel>thought
-  CLOSE : <channel|>
-
-Ces balises peuvent être découpées sur plusieurs TextPartDelta consécutifs.
-GemmaThinkingParser bufférise les données pour les détecter de façon fiable
-même si elles arrivent fractionnées.
+Avec mlx-openai-server (--reasoning-parser gemma4) :
+  - Les balises <|channel>thought…<channel|> sont strippées côté serveur.
+  - Le raisonnement est exposé comme delta.reasoning_content dans le flux SSE.
+  - pydantic-ai 1.79.0 le capte nativement via _map_thinking_delta()
+    → ThinkingPartDelta(content_delta=...) → reasoningDelta ici.
+  - TextPartDelta ne contient jamais de balises de réflexion brutes.
+  - Le raisonnement n'est pas persisté en base — pas de parsing historique nécessaire.
 """
 
 from __future__ import annotations
@@ -29,7 +29,10 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
     TextPartDelta,
+    ThinkingPart,
     ThinkingPartDelta,
     ToolReturnPart,
 )
@@ -39,159 +42,49 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ── Balises de réflexion Gemma 4 ────────────────────────────────────────────
-_OPEN_TAG  = "<|channel>thought"
-_CLOSE_TAG = "<channel|>"
-# Taille du buffer de sécurité pour détecter les balises découpées entre chunks
-_GUARD = max(len(_OPEN_TAG), len(_CLOSE_TAG))
-
-
-class GemmaThinkingParser:
-    """
-    Buffer-state machine pour intercepter les balises de réflexion de Gemma.
-
-    Utilisation :
-        parser = GemmaThinkingParser()
-        for chunk in text_stream:
-            for event_type, content in parser.feed(chunk):
-                # event_type: "textDelta" ou "reasoningDelta"
-                emit(event_type, content)
-        # En fin de stream, vider le buffer résiduel
-        for event_type, content in parser.flush():
-            emit(event_type, content)
-    """
-
-    def __init__(self) -> None:
-        self._buffer: str = ""
-        self._in_thinking: bool = False
-
-    def feed(self, chunk: str) -> list[tuple[str, str]]:
-        """
-        Ingère un chunk de texte et retourne une liste de (type, contenu).
-
-        On garde toujours les _GUARD derniers caractères en buffer pour ne pas
-        émettre prématurément du texte qui serait la première moitié d'une balise.
-        """
-        self._buffer += chunk
-        events: list[tuple[str, str]] = []
-
-        while True:
-            if not self._in_thinking:
-                idx = self._buffer.find(_OPEN_TAG)
-                if idx == -1:
-                    # Pas de balise d'ouverture — émettre tout sauf le garde
-                    safe_len = max(0, len(self._buffer) - _GUARD)
-                    if safe_len > 0:
-                        events.append(("textDelta", self._buffer[:safe_len]))
-                        self._buffer = self._buffer[safe_len:]
-                    break
-                else:
-                    # Texte avant la balise d'ouverture
-                    if idx > 0:
-                        events.append(("textDelta", self._buffer[:idx]))
-                    self._buffer = self._buffer[idx + len(_OPEN_TAG):]
-                    self._in_thinking = True
-            else:
-                idx = self._buffer.find(_CLOSE_TAG)
-                if idx == -1:
-                    # Toujours dans le thinking — émettre tout sauf le garde
-                    safe_len = max(0, len(self._buffer) - _GUARD)
-                    if safe_len > 0:
-                        events.append(("reasoningDelta", self._buffer[:safe_len]))
-                        self._buffer = self._buffer[safe_len:]
-                    break
-                else:
-                    # Raisonnement jusqu'à la balise de fermeture
-                    if idx > 0:
-                        events.append(("reasoningDelta", self._buffer[:idx]))
-                    self._buffer = self._buffer[idx + len(_CLOSE_TAG):]
-                    self._in_thinking = False
-
-        return events
-
-    def flush(self) -> list[tuple[str, str]]:
-        """Vide le buffer résiduel à la fin du stream."""
-        if not self._buffer:
-            return []
-        event_type = "reasoningDelta" if self._in_thinking else "textDelta"
-        result = [(event_type, self._buffer)]
-        self._buffer = ""
-        return result
-
-
-# ── Parsing statique (messages historiques) ──────────────────────────────────
-
-def parse_thinking_tags(text: str) -> list[tuple[str, str]]:
-    """
-    Parse un texte complet contenant des balises Gemma et retourne une liste
-    de (type, contenu) prête à être convertie en MessagePartResponse.
-
-    Utilisé pour les messages chargés depuis la base de données, où le texte
-    stocké dans TextPart peut encore contenir les balises brutes.
-
-    Exemple :
-        "Intro <|channel>thought raisonnement <channel|> suite"
-        → [("text", "Intro "), ("reasoning", " raisonnement "), ("text", " suite")]
-    """
-    results: list[tuple[str, str]] = []
-    remaining = text
-    in_thinking = False
-
-    while remaining:
-        if not in_thinking:
-            idx = remaining.find(_OPEN_TAG)
-            if idx == -1:
-                if remaining:
-                    results.append(("text", remaining))
-                break
-            if idx > 0:
-                results.append(("text", remaining[:idx]))
-            remaining = remaining[idx + len(_OPEN_TAG):]
-            in_thinking = True
-        else:
-            idx = remaining.find(_CLOSE_TAG)
-            if idx == -1:
-                # Balise de fermeture manquante — tout le reste est du reasoning
-                if remaining:
-                    results.append(("reasoning", remaining))
-                break
-            if idx > 0:
-                results.append(("reasoning", remaining[:idx]))
-            remaining = remaining[idx + len(_CLOSE_TAG):]
-            in_thinking = False
-
-    return [(t, c) for t, c in results if c]
-
 
 # ── Transformateur principal ─────────────────────────────────────────────────
 
-def transform_agent_event(
-    event: "AgentStreamEvent",
-    parser: GemmaThinkingParser,
-) -> list[dict]:
+def transform_agent_event(event: "AgentStreamEvent") -> list[dict]:
     """
     Convertit un événement Pydantic AI natif en 0-N dicts BFF prêts à sérialiser.
 
+    Avec mlx-openai-server, le flux pydantic-ai produit :
+      - TextPartDelta       → textDelta (texte propre, sans balises de réflexion)
+      - ThinkingPartDelta   → reasoningDelta (depuis delta.reasoning_content natif)
+      - FunctionToolCallEvent  → toolCallStart
+      - FunctionToolResultEvent → toolCallResult
+
     Les événements non pertinents pour le frontend (FinalResultEvent,
-    PartStartEvent, PartEndEvent, BuiltinTool*) sont silencieusement ignorés.
-    L'appelant est responsable de capturer AgentRunResultEvent séparément
-    (il n'est pas de type AgentStreamEvent).
+    PartEndEvent, BuiltinTool*) sont silencieusement ignorés.
+    PartStartEvent est traité pour récupérer le 1er token de chaque part.
     """
     results: list[dict] = []
 
-    # ── TextPartDelta : texte ou raisonnement (selon balises Gemma) ──────────
-    if isinstance(event, PartDeltaEvent):
+    # ── PartStartEvent — premier token de chaque part ───────────────────────
+    # CRITIQUE : pydantic-ai place le 1er token dans PartStartEvent.part.content,
+    # PAS dans un PartDeltaEvent. Ignorer cet event fait perdre le 1er chunk.
+    if isinstance(event, PartStartEvent):
+        part = event.part
+        if isinstance(part, TextPart) and part.content:
+            results.append({"type": "textDelta", "content": part.content})
+        elif isinstance(part, ThinkingPart) and part.content:
+            results.append({"type": "reasoningDelta", "content": part.content})
+        # ToolCallPart via PartStartEvent → géré séparément par FunctionToolCallEvent
+
+    # ── TextPartDelta / ThinkingPartDelta ────────────────────────────────────
+    elif isinstance(event, PartDeltaEvent):
         delta = event.delta
 
         if isinstance(delta, TextPartDelta):
-            for event_type, content in parser.feed(delta.content_delta):
-                if content:
-                    results.append({"type": event_type, "content": content})
+            if delta.content_delta:
+                results.append({"type": "textDelta", "content": delta.content_delta})
 
         elif isinstance(delta, ThinkingPartDelta):
-            # Le modèle supporte le thinking natif (ex: Claude) — émettre directement
-            if delta.thinking_delta:
-                results.append({"type": "reasoningDelta", "content": delta.thinking_delta})
+            # ThinkingPartDelta.content_delta : tokens de raisonnement
+            # (delta.reasoning_content intercepté nativement par pydantic-ai)
+            if delta.content_delta:
+                results.append({"type": "reasoningDelta", "content": delta.content_delta})
 
         # ToolCallPartDelta : déltas des arguments d'outil — ignorés côté frontend
         # (on n'émet toolCallStart qu'une fois via FunctionToolCallEvent)
@@ -208,16 +101,17 @@ def transform_agent_event(
     # ── Résultat d'outil ─────────────────────────────────────────────────────
     elif isinstance(event, FunctionToolResultEvent):
         result_part = event.result
-        content = ""
-        if isinstance(result_part, ToolReturnPart):
-            content = str(result_part.content)
-        results.append({
+        evt: dict = {
             "type": "toolCallResult",
             "toolCallId": event.tool_call_id,
-            "content": content,
-        })
+        }
+        # metadata : données structurées pour l'aperçu frontend.
+        # Définies via ToolReturn(return_value=..., metadata=...) — jamais envoyées au LLM.
+        if isinstance(result_part, ToolReturnPart) and result_part.metadata is not None:
+            evt["preview"] = result_part.metadata
+        results.append(evt)
 
-    # Tous les autres (PartStartEvent, PartEndEvent, FinalResultEvent,
+    # Tous les autres (PartEndEvent, FinalResultEvent,
     # BuiltinToolCallEvent, BuiltinToolResultEvent) → ignorés
 
     return results

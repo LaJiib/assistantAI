@@ -1,26 +1,37 @@
 """
 Iris — Backend FastAPI
-GET /health  |  POST /chat  |  POST /chat/stream  |  POST /agent/chat
+GET  /health              |  Debug : état du serveur
+POST /agent/chat          |  Debug : génération stateless via IrisAgent
+POST /agent/chat/stream   |  Debug : streaming SSE stateless
+POST /agent/title         |  Génération de titre court
 
 Démarrage : python main.py
+
+Architecture A2 :
+  - mlx-openai-server (subprocess, port 8001) ← Gemma 4 via mlx-vlm
+  - FastAPI BFF (port 8000) ← Swift client
+  - pydantic-ai Agent (ReasoningAwareOpenAIModel) ← orchestre tool loop
 """
 
 import asyncio
 import json
 import logging
 import os
+import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
-from contextlib import asynccontextmanager, suppress
 
+import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
-from core.llm import IrisEngine
-from core.agent import IrisDeps, create_iris_agent, IRIS_SYSTEM_PROMPT
+from core.agent import IrisDeps, ReasoningAwareOpenAIModel, create_iris_agent
 from core.tools import ToolRegistry
+from pydantic_ai.providers.openai import OpenAIProvider
 from api.conversations import router as conversations_router
 from api.messages import router as messages_router
 from storage.json_manager import JSONManager
@@ -36,45 +47,78 @@ logger = logging.getLogger(__name__)
 
 # Construit le chemin absolu vers le .env (situé à côté de main.py)
 env_path = Path(__file__).parent / ".env"
-
-# Le paramètre override=True force l'écrasement au cas où une variable vide traînerait
 load_dotenv(dotenv_path=env_path, override=True)
 
-MODEL_PATH = os.getenv("MODEL_PATH", "")
-HOST       = os.getenv("HOST", "127.0.0.1")
-PORT       = int(os.getenv("PORT", "8000"))
-DATA_FOLDER = os.getenv("DATA_FOLDER", "").strip()
+MODEL_PATH   = os.getenv("MODEL_PATH", "")
+HOST         = os.getenv("HOST", "127.0.0.1")
+PORT         = int(os.getenv("PORT", "8000"))
+DATA_FOLDER  = os.getenv("DATA_FOLDER", "").strip()
 TOOLS_FOLDER = os.getenv("TOOLS_FOLDER", "").strip()
-MAX_GENERATION_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "512"))
+MLX_SERVER_PORT = int(os.getenv("MLX_SERVER_PORT", "8001"))
+
+MAX_GENERATION_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "4096"))
 if MAX_GENERATION_TOKENS <= 0:
-    logger.warning("MAX_GENERATION_TOKENS invalide (%s), fallback à 512", MAX_GENERATION_TOKENS)
-    MAX_GENERATION_TOKENS = 512
-GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.3"))
+    logger.warning("MAX_GENERATION_TOKENS invalide (%s), fallback à 4096", MAX_GENERATION_TOKENS)
+    MAX_GENERATION_TOKENS = 4096
+
+GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "1.0"))
 if not (0.0 <= GENERATION_TEMPERATURE <= 2.0):
-    logger.warning("GENERATION_TEMPERATURE invalide (%s), fallback à 0.3", GENERATION_TEMPERATURE)
-    GENERATION_TEMPERATURE = 0.3
-GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.0"))
+    logger.warning("GENERATION_TEMPERATURE invalide (%s), fallback à 1.0", GENERATION_TEMPERATURE)
+    GENERATION_TEMPERATURE = 1.0
+
+GENERATION_TOP_P = float(os.getenv("GENERATION_TOP_P", "0.95"))
 if not (0.0 <= GENERATION_TOP_P <= 1.0):
-    logger.warning("GENERATION_TOP_P invalide (%s), fallback à 0.0", GENERATION_TOP_P)
-    GENERATION_TOP_P = 0.0
-GENERATION_TOP_K = int(os.getenv("GENERATION_TOP_K", "0"))
+    logger.warning("GENERATION_TOP_P invalide (%s), fallback à 0.95", GENERATION_TOP_P)
+    GENERATION_TOP_P = 0.95
+
+GENERATION_TOP_K = int(os.getenv("GENERATION_TOP_K", "64"))
 if GENERATION_TOP_K < 0:
     logger.warning("GENERATION_TOP_K invalide (%s), fallback à 0", GENERATION_TOP_K)
     GENERATION_TOP_K = 0
+
+# ── Commande de démarrage mlx-openai-server ───────────────────────────────────
+
+def _build_mlx_cmd(model_path: str, port: int) -> list[str]:
+    return [
+        "mlx-openai-server", "launch",
+        "--model-path",        model_path,
+        "--model-type",        "multimodal",
+        "--reasoning-parser",  "gemma4",
+        "--tool-call-parser",  "gemma4",
+        "--enable-auto-tool-choice",
+        "--served-model-name", "gemma4",
+        "--host",              "127.0.0.1",
+        "--port",              str(port),
+        "--context-length",    "32768",
+        "--temperature",       "1.0",
+        "--queue-timeout",     "300",
+        "--no-log-file",
+    ]
+
+
+async def _wait_until_ready(url: str, timeout: float = 180.0) -> None:
+    """Poll /health jusqu'à ce que mlx-openai-server soit prêt (max timeout secondes)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    async with httpx.AsyncClient() as client:
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                r = await client.get(url, timeout=2.0)
+                if r.status_code == 200:
+                    logger.info("✅ mlx-openai-server prêt sur %s", url)
+                    return
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                pass
+            await asyncio.sleep(1.5)
+    raise TimeoutError(f"mlx-openai-server non prêt après {timeout:.0f}s ({url})")
 
 
 def _resolve_tools_folder() -> Path:
     """
     Dossier de persistance des outils.
-
-    Priorité :
-      1) TOOLS_FOLDER explicite
-      2) sibling de DATA_FOLDER (si DATA_FOLDER se termine par /conversations)
-      3) DATA_FOLDER/tools_registry
+    Priorité : TOOLS_FOLDER explicite > sibling de DATA_FOLDER > DATA_FOLDER/tools_registry
     """
     if TOOLS_FOLDER:
         return Path(TOOLS_FOLDER)
-
     data_path = Path(DATA_FOLDER)
     if data_path.name.lower() == "conversations":
         return data_path.parent / "tools_registry"
@@ -83,16 +127,8 @@ def _resolve_tools_folder() -> Path:
 
 # ── Schémas ───────────────────────────────────────────────────────────────────
 
-class ChatRequest(BaseModel):
-    prompt:      str   = Field(..., min_length=1)
-    max_tokens:  int   = Field(MAX_GENERATION_TOKENS, gt=0, le=32768)
-    temperature: float = Field(GENERATION_TEMPERATURE, ge=0.0, le=2.0)
-
-class ChatResponse(BaseModel):
-    response: str
-
 class AgentChatRequest(BaseModel):
-    """Requête pour l'endpoint agent — utilise IrisAgent (Pydantic AI)."""
+    """Requête pour les endpoints debug agent."""
     message:     str   = Field(..., min_length=1, description="Message utilisateur")
     max_tokens:  int   = Field(MAX_GENERATION_TOKENS, gt=0, le=32768)
     temperature: float = Field(GENERATION_TEMPERATURE, ge=0.0, le=2.0)
@@ -119,7 +155,7 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- Startup ---
+    # ── Startup ──────────────────────────────────────────────────────────────
     logger.info("🌸 Démarrage Iris backend…")
 
     if not DATA_FOLDER:
@@ -135,40 +171,47 @@ async def lifespan(app: FastAPI):
     await register_builtin_tools(registry)
     app.state.tool_registry = registry
 
-    app.state.engine = None
-    app.state.iris_agent = None
-    app.state.model_loading = False
-    app.state.model_error = None
-    app.state.model_task = None
-    app.state.max_generation_tokens   = MAX_GENERATION_TOKENS
-    app.state.generation_temperature  = GENERATION_TEMPERATURE
-    app.state.generation_top_p        = GENERATION_TOP_P
-    app.state.generation_top_k        = GENERATION_TOP_K
+    app.state.iris_agent  = None
+    app.state.mlx_proc    = None
+    app.state.local_client = None
+    app.state.max_generation_tokens  = MAX_GENERATION_TOKENS
+    app.state.generation_temperature = GENERATION_TEMPERATURE
+    app.state.generation_top_p       = GENERATION_TOP_P
+    app.state.generation_top_k       = GENERATION_TOP_K
 
     if not MODEL_PATH:
-        app.state.model_error = "MODEL_PATH non défini"
         logger.error("❌ MODEL_PATH non défini (vérifiez .env)")
-    else:
-        app.state.model_loading = True
+        raise RuntimeError("MODEL_PATH non défini")
 
-        async def _load_model():
-            try:
-                engine = IrisEngine(model_path=MODEL_PATH)
-                await engine.load()
-                app.state.engine = engine
-                # Créer l'agent Pydantic AI une fois le moteur chargé (Étape 3 : web tools)
-                app.state.iris_agent = create_iris_agent(
-                    engine,
-                    tools=[web_search, fetch_webpage],
-                )
-                logger.info("✅ Iris prête : %s", engine.model_name)
-            except Exception as exc:
-                app.state.model_error = str(exc)
-                logger.exception("❌ Échec chargement modèle")
-            finally:
-                app.state.model_loading = False
+    # ── Lancer mlx-openai-server en subprocess ────────────────────────────
+    mlx_cmd = _build_mlx_cmd(MODEL_PATH, MLX_SERVER_PORT)
+    logger.info("🚀 Lancement mlx-openai-server (port %d)…", MLX_SERVER_PORT)
+    logger.info("   %s", " ".join(mlx_cmd))
 
-        app.state.model_task = asyncio.create_task(_load_model())
+    proc = subprocess.Popen(mlx_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    app.state.mlx_proc = proc
+
+    # ── Attendre que le serveur soit prêt (bloquant, max 180s) ───────────
+    try:
+        await _wait_until_ready(f"http://127.0.0.1:{MLX_SERVER_PORT}/health")
+    except TimeoutError as exc:
+        proc.terminate()
+        raise RuntimeError(str(exc)) from exc
+
+    # ── Créer client OpenAI + modèle + agent ─────────────────────────────
+    local_client = AsyncOpenAI(
+        base_url=f"http://127.0.0.1:{MLX_SERVER_PORT}/v1",
+        api_key="not-needed",
+    )
+    app.state.local_client = local_client
+
+    provider = OpenAIProvider(openai_client=local_client)
+    model    = ReasoningAwareOpenAIModel("gemma4", provider=provider)
+
+    app.state.iris_agent = create_iris_agent(
+        model,
+        tools=[web_search, fetch_webpage],
+    )
 
     logger.info("📡 Écoute sur http://%s:%d", HOST, PORT)
     logger.info("🧰 tools_registry=%s", tools_folder)
@@ -180,23 +223,20 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # --- Shutdown ---
-        task = getattr(app.state, "model_task", None)
-        if task and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-
-        try:
-            import mlx.core as mx
-            mx.clear_cache()
-        except Exception:
-            pass
+        # ── Shutdown ──────────────────────────────────────────────────────
+        mlx_proc: subprocess.Popen | None = getattr(app.state, "mlx_proc", None)
+        if mlx_proc is not None:
+            logger.info("⏹  Arrêt mlx-openai-server (pid %d)…", mlx_proc.pid)
+            mlx_proc.terminate()
+            try:
+                mlx_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                mlx_proc.kill()
 
 
 app = FastAPI(
     title="Iris — Assistant Consulting Backend",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 app.include_router(conversations_router)
@@ -207,14 +247,17 @@ app.include_router(messages_router)
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    engine: IrisEngine | None = getattr(app.state, "engine", None)
-    loaded = engine is not None and engine.is_loaded
+    iris_agent = getattr(app.state, "iris_agent", None)
+    mlx_proc: subprocess.Popen | None = getattr(app.state, "mlx_proc", None)
+    loaded = iris_agent is not None and mlx_proc is not None and mlx_proc.poll() is None
+    model_name = Path(MODEL_PATH).name if MODEL_PATH else "none"
     return HealthResponse(
         status="ok" if loaded else "degraded",
         model_loaded=loaded,
-        model_name=engine.model_name if engine else "none",
+        model_name=model_name,
         pid=os.getpid(),
     )
+
 
 @app.post("/agent/chat", response_model=AgentChatResponse)
 async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
@@ -222,67 +265,60 @@ async def agent_chat(request: AgentChatRequest) -> AgentChatResponse:
     [DEBUG] Génère une réponse via IrisAgent sans conversation persistée.
 
     Endpoint de test/debug uniquement. Le frontend utilise
-    POST /api/conversations/{id}/messages/ pour la génération persistée.
+    POST /api/conversations/{id}/messages/stream pour la génération persistée.
     """
     iris_agent = getattr(app.state, "iris_agent", None)
-    engine: IrisEngine | None = getattr(app.state, "engine", None)
-
-    if not iris_agent or not engine or not engine.is_loaded:
+    if iris_agent is None:
         raise HTTPException(status_code=503, detail="Agent Iris non initialisé.")
 
     try:
         from pydantic_ai.settings import ModelSettings
         settings = ModelSettings(
             max_tokens=min(request.max_tokens, int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))),
-            temperature=min(request.temperature, float(getattr(app.state, "max_generation_temperature", GENERATION_TEMPERATURE))),
+            temperature=request.temperature,
         )
         result = await iris_agent.run(
             request.message,
-            deps=IrisDeps(),   # Étape 2 : injecter VectorStoreManager ici
+            deps=IrisDeps(),
             model_settings=settings,
         )
         return AgentChatResponse(
-            response=result.data,
-            model=engine.model_name,
+            response=result.output,
+            model="gemma4",
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/agent/chat/stream")
-def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
+async def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
     """
-    [DEBUG] Streaming SSE stateless via engine.stream_messages() + IRIS_SYSTEM_PROMPT.
+    [DEBUG] Streaming SSE stateless via IrisAgent.
 
     Endpoint de test/debug uniquement. Le frontend utilise
     POST /api/conversations/{id}/messages/stream pour la génération avec
     persistance et IrisAgent (Pydantic AI + tool calling).
     """
-    engine: IrisEngine | None = getattr(app.state, "engine", None)
-    max_generation_tokens: int = int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))
-    max_generation_temperature: float = float(
-        getattr(app.state, "max_generation_temperature", GENERATION_TEMPERATURE)
+    iris_agent = getattr(app.state, "iris_agent", None)
+    if iris_agent is None:
+        raise HTTPException(status_code=503, detail="Agent Iris non initialisé.")
+
+    from pydantic_ai.settings import ModelSettings
+    settings = ModelSettings(
+        max_tokens=min(request.max_tokens, int(getattr(app.state, "max_generation_tokens", MAX_GENERATION_TOKENS))),
+        temperature=request.temperature,
     )
-    if not engine or not engine.is_loaded:
-        raise HTTPException(status_code=503, detail="Modèle non chargé.")
 
-    effective_max_tokens  = min(request.max_tokens,  max_generation_tokens)
-    effective_temperature = min(request.temperature, max_generation_temperature)
-
-    messages = [
-        {"role": "system", "content": IRIS_SYSTEM_PROMPT},
-        {"role": "user",   "content": request.message},
-    ]
-
-    def sse():
+    async def sse():
         try:
-            for chunk in engine.stream_messages(
-                messages,
-                max_tokens=effective_max_tokens,
-                temperature=effective_temperature,
-            ):
-                yield f"data: {json.dumps({'text': chunk})}\n\n"
-        except RuntimeError as exc:
+            async with iris_agent.run_stream(
+                request.message,
+                deps=IrisDeps(),
+                model_settings=settings,
+            ) as stream:
+                async for chunk in stream.stream_text(delta=True):
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+        except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
         finally:
             yield "data: [DONE]\n\n"
@@ -290,32 +326,38 @@ def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
     return StreamingResponse(sse(), media_type="text/event-stream")
 
 
+_TITLE_SYSTEM = (
+    "Your only task is to generate a very short title (max 10 words) "
+    "that summarizes the user's request. "
+    "Respond with only the title, no punctuation around it, nothing else."
+)
+
+
 @app.post("/agent/title", response_model=TitleResponse)
-def agent_title(request: TitleRequest) -> TitleResponse:
+async def agent_title(request: TitleRequest) -> TitleResponse:
     """
     Génère un titre court (≤ 10 mots) pour une conversation.
 
     Le frontend envoie uniquement le texte brut du premier message utilisateur.
-    Tout le prompt engineering (instruction de titrage) est centralisé ici.
+    Utilise le client OpenAI directement (bypass pydantic-ai) pour réduire la latence.
     """
-    engine: IrisEngine | None = getattr(app.state, "engine", None)
-    if not engine or not engine.is_loaded:
-        raise HTTPException(status_code=503, detail="Modèle non chargé.")
+    local_client: AsyncOpenAI | None = getattr(app.state, "local_client", None)
+    if local_client is None:
+        raise HTTPException(status_code=503, detail="Service non initialisé.")
 
-    _TITLE_SYSTEM = (
-        "Your only task is to generate a very short title (max 10 words) "
-        "that summarizes the user's request. "
-        "Respond with only the title, no punctuation around it, nothing else."
-    )
-    messages = [
-        {"role": "system", "content": _TITLE_SYSTEM},
-        {"role": "user",   "content": request.message},
-    ]
     try:
-        raw = engine._generate_raw(messages, None, 30, 0.1)
-        title = raw.strip().strip("\"'")
-        return TitleResponse(title=title or "Nouvelle conversation")
-    except RuntimeError as exc:
+        resp = await local_client.chat.completions.create(
+            model="gemma4",
+            messages=[
+                {"role": "system", "content": _TITLE_SYSTEM},
+                {"role": "user",   "content": request.message},
+            ],
+            max_tokens=30,
+            temperature=0.1,
+        )
+        raw = (resp.choices[0].message.content or "").strip().strip("\"'")
+        return TitleResponse(title=raw or "Nouvelle conversation")
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 

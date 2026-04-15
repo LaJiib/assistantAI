@@ -60,17 +60,42 @@ from pydantic_ai.messages import (
     ModelResponse,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     UserPromptPart,
 )
 from pydantic_ai.settings import ModelSettings
 
 from core.agent import IrisDeps, build_dynamic_system_prompt
-from core.sse_transformer import GemmaThinkingParser, parse_thinking_tags, transform_agent_event
+from core.sse_transformer import transform_agent_event
 from models.conversation import MessageMeta, _utcnow
 from storage.json_manager import JSONManager
 
 logger = logging.getLogger(__name__)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _prepare_for_storage(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """
+    Nettoie les messages avant persistance :
+    - Retire les ThinkingPart (Gemma 4 ne les accepte pas dans l'historique multi-tours)
+    - Omet usage → défaut Usage() (zéros) → éliminé par exclude_defaults dans le serialiseur
+    """
+    result = []
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            clean_parts = [p for p in msg.parts if not isinstance(p, ThinkingPart)]
+            if clean_parts:
+                result.append(ModelResponse(
+                    parts=clean_parts,
+                    model_name=msg.model_name,
+                    timestamp=msg.timestamp,
+                ))
+        else:
+            result.append(msg)
+    return result
+
 
 router = APIRouter(
     prefix="/api/conversations/{conversation_id}/messages",
@@ -99,8 +124,7 @@ def get_json_manager(request: Request) -> JSONManager:
 def get_iris_agent(request: Request):
     """Injecte IrisAgent (Pydantic AI) ou lève 503 si non initialisé."""
     agent = getattr(request.app.state, "iris_agent", None)
-    engine = getattr(request.app.state, "engine", None)
-    if agent is None or engine is None or not engine.is_loaded:
+    if agent is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent Iris non initialisé. Réessayez dans quelques secondes.",
@@ -204,9 +228,7 @@ def _model_message_to_response(
         parts = []
         for part in msg.parts:
             if isinstance(part, TextPart) and part.content:
-                # Parser les balises de réflexion Gemma stockées dans le texte brut
-                for part_type, content in parse_thinking_tags(part.content):
-                    parts.append(MessagePartResponse(type=part_type, content=content))
+                parts.append(MessagePartResponse(type="text", content=part.content))
             elif isinstance(part, ToolCallPart):
                 parts.append(MessagePartResponse(
                     type="toolCall",
@@ -341,7 +363,6 @@ async def send_message_stream(
         )
 
         run_result = None
-        parser = GemmaThinkingParser()
 
         try:
             # ── 3. Itérer sur les événements Pydantic AI ──────────────────────
@@ -358,13 +379,8 @@ async def send_message_stream(
                     continue
 
                 # Transformer l'événement natif en 0-N dicts BFF
-                for bff_event in transform_agent_event(event, parser):
+                for bff_event in transform_agent_event(event):
                     yield f"data: {json.dumps(bff_event)}\n\n"
-
-            # Vider le buffer résiduel du parser Gemma
-            for event_type, content in parser.flush():
-                if content:
-                    yield f"data: {json.dumps({'type': event_type, 'content': content})}\n\n"
 
         except Exception as exc:
             logger.error("Erreur stream [%s] : %s", conversation_id, exc, exc_info=True)
@@ -377,7 +393,7 @@ async def send_message_stream(
             if run_result is not None:
                 try:
                     new_msgs = run_result.new_messages()
-                    agent_msgs = new_msgs[1:]  # On exclut le user_request initial
+                    agent_msgs = _prepare_for_storage(new_msgs[1:])  # On exclut le user_request initial
 
                     if agent_msgs:
                         with lock:

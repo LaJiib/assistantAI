@@ -41,11 +41,42 @@ struct Message: Identifiable, Equatable, Decodable {
     }
 }
 
+// MARK: - Tool Preview
+
+/// Aperçu structuré d'un résultat d'outil, transmis via SSE metadata.
+/// Uniquement peuplé en streaming — nil pour les messages historiques.
+struct ToolPreview: Equatable, Decodable {
+    let previewType: String           // "searchResults" | "webpage"
+    // searchResults
+    let query: String?
+    let count: Int?
+    let results: [SearchResultItem]?
+    // webpage
+    let url: String?
+    let wordCount: Int?
+    let truncated: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case previewType = "type"
+        case query, count, results
+        case url, wordCount, truncated
+    }
+}
+
+struct SearchResultItem: Equatable, Decodable {
+    let title: String
+    let url: String
+}
+
+// MARK: - MessagePart
+
 struct MessagePart: Equatable, Decodable {
     let type: PartType
     var content: String?
     var toolCallId: String?
     var toolName: String?
+    var preview: ToolPreview? = nil     // aperçu structuré (SSE uniquement)
+    var isCompleted: Bool? = nil        // true quand toolCallResult reçu
 
     enum PartType: String, Decodable {
         case text, reasoning, toolCall, toolResult

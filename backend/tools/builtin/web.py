@@ -30,7 +30,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 import trafilatura
-from pydantic_ai import RunContext
+from pydantic_ai import RunContext, ToolReturn
 
 from core.agent import IrisDeps
 
@@ -206,7 +206,7 @@ async def web_search(
     category: Literal["general", "news", "science", "files", "images"] = "general",
     time_range: Literal["day", "week", "month", "year", None] = None,
     max_results: int = 5,
-) -> list[dict[str, Any]] | dict[str, str]:
+) -> ToolReturn | dict[str, str]:
     """
     Search the web to retrieve up-to-date information, external knowledge, and verifiable facts across any domain.
     
@@ -267,28 +267,48 @@ async def web_search(
 
     raw_results: list[dict] = data.get("results", [])
     if not raw_results:
-        return "No results found for this query."
+        return {"error": "No results found for this query."}
 
-    # Format de sortie optimisé : Structured Reference Style avec Score
+    results_slice = raw_results[:max_results]
+
+    # Markdown pour le modèle — format Structured Reference Style avec Score
     formatted = ["### SEARCH RESULTS"]
-    for i, item in enumerate(raw_results[:max_results], 1):
+    for i, item in enumerate(results_slice, 1):
         title = item.get("title", "N/A").strip()
         url = item.get("url", "N/A").strip()
         snippet = item.get("content", "No snippet available.").strip()
-        # On récupère le score (souvent un float ou un int, on le formate)
         score = item.get("score")
         score_str = f"{score:.2f}" if isinstance(score, (int, float)) else "N/A"
-        
+
         entry = (
-            f"SOURCE [{i}]\n"
-            f"RELEVANCE SCORE: {score_str}\n"
-            f"TITLE: {title}\n"
-            f"URL: {url}\n"
-            f"SNIPPET: {snippet}"
+            f"### SOURCE [{i}]\n"
+            f"**RELEVANCE SCORE:** {score_str}\n"
+            f"**TITLE:** {title}\n"
+            f"**URL:** {url}\n"
+            f"**SNIPPET:** {snippet}"
         )
         formatted.append(entry)
 
-    return "\n\n".join(formatted)
+    markdown = "\n\n".join(formatted)
+
+    # Métadonnées structurées pour l'aperçu frontend (titre + URL uniquement)
+    preview_results = [
+        {
+            "title": item.get("title", "N/A").strip(),
+            "url": item.get("url", "N/A").strip(),
+        }
+        for item in results_slice
+    ]
+
+    return ToolReturn(
+        return_value=markdown,
+        metadata={
+            "type": "searchResults",
+            "query": query,
+            "count": len(results_slice),
+            "results": preview_results,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +339,7 @@ async def fetch_webpage(
     ctx: RunContext[IrisDeps],
     url: str,
     timeout: float = 10.0,
-) -> dict[str, Any]:
+) -> ToolReturn | dict[str, str]:
     """
     Fetch and extract the clean text content of a web page.
 
@@ -453,9 +473,17 @@ async def fetch_webpage(
         " (tronqué)" if truncated else "",
     )
 
-    return {
-        "url":        url,
-        "content":    _wrap_external_content(url, text),
-        "word_count": word_count,
-        "truncated":  truncated,
-    }
+    return ToolReturn(
+        return_value={
+            "url":        url,
+            "content":    _wrap_external_content(url, text),
+            "word_count": word_count,
+            "truncated":  truncated,
+        },
+        metadata={
+            "type":      "webpage",
+            "url":       url,
+            "wordCount": word_count,
+            "truncated": truncated,
+        },
+    )

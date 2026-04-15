@@ -1,8 +1,8 @@
 // BackendSettingsView.swift
 // AssistantIA
 //
-// Vue de monitoring et contrôle du backend Python.
-// Accessible via Settings / Debug — permet Start/Stop manuel et diagnostic.
+// Vue de monitoring et reconnexion au backend Python.
+// Le backend est lancé indépendamment (VSCode / terminal).
 
 import SwiftUI
 internal import Combine
@@ -10,8 +10,7 @@ internal import Combine
 struct BackendSettingsView: View {
     @Environment(BackendManager.self) private var backendManager
     @State private var errorExpanded = false
-    @State private var isRestarting = false
-    @State private var startedAt: Date? = nil
+    @State private var connectingAt: Date? = nil
 
     var body: some View {
         Form {
@@ -25,10 +24,8 @@ struct BackendSettingsView: View {
         .formStyle(.grouped)
         .navigationTitle("Backend Python")
         .onChange(of: backendManager.state) { _, newState in
-            if case .starting = newState { startedAt = Date() }
-            if case .running = newState  { startedAt = nil }
-            if case .stopped = newState  { startedAt = nil }
-            if case .error   = newState  { startedAt = nil }
+            if case .connecting = newState { connectingAt = Date() }
+            else { connectingAt = nil }
         }
     }
 
@@ -42,14 +39,14 @@ struct BackendSettingsView: View {
                     Text(backendManager.state.displayText)
                         .font(.body)
                         .fontWeight(.medium)
-                    if case .starting = backendManager.state, let t = startedAt {
+                    if case .connecting = backendManager.state, let t = connectingAt {
                         ElapsedTimeView(since: t)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
                 Spacer()
-                if case .starting = backendManager.state {
+                if case .connecting = backendManager.state {
                     ProgressView()
                         .controlSize(.small)
                 }
@@ -65,7 +62,7 @@ struct BackendSettingsView: View {
             Image(systemName: "circle")
                 .foregroundStyle(.secondary)
                 .font(.title2)
-        case .starting:
+        case .connecting:
             Image(systemName: "circle.dotted")
                 .foregroundStyle(.orange)
                 .font(.title2)
@@ -84,46 +81,16 @@ struct BackendSettingsView: View {
     // MARK: - Actions Section
 
     private var actionsSection: some View {
-        Section("Contrôles") {
-            switch backendManager.state {
-            case .stopped, .error:
-                Button {
-                    Task { try? await backendManager.start() }
-                } label: {
-                    Label("Démarrer le backend", systemImage: "play.fill")
-                }
-
-            case .starting:
-                Button(role: .destructive) {
-                    backendManager.stop()
-                } label: {
-                    Label("Annuler le démarrage", systemImage: "stop.fill")
-                }
-
-            case .running:
-                Button(role: .destructive) {
-                    backendManager.stop()
-                } label: {
-                    Label("Arrêter le backend", systemImage: "stop.fill")
-                }
-
-                Button {
-                    Task {
-                        isRestarting = true
-                        backendManager.stop()
-                        // Attendre que l'arrêt soit effectif
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        try? await backendManager.start()
-                        isRestarting = false
-                    }
-                } label: {
-                    HStack {
-                        Label("Redémarrer", systemImage: "arrow.clockwise")
-                        if isRestarting { ProgressView().controlSize(.mini) }
-                    }
-                }
-                .disabled(isRestarting)
+        Section("Connexion") {
+            Button {
+                Task { await backendManager.reconnect() }
+            } label: {
+                Label("Reconnecter", systemImage: "arrow.clockwise")
             }
+            .disabled({
+                if case .connecting = backendManager.state { return true }
+                return false
+            }())
         }
     }
 
@@ -155,7 +122,7 @@ struct BackendSettingsView: View {
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
         } header: {
-            Label("Erreur de démarrage", systemImage: "exclamationmark.triangle.fill")
+            Label("Erreur de connexion", systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
         }
     }
@@ -187,10 +154,11 @@ struct BackendSettingsView: View {
                 }
             }
 
-            LabeledContent("Logs") {
-                Text("Console Xcode — filtre \"[Backend]\"")
-                    .font(.caption)
+            LabeledContent("Lancer le backend") {
+                Text("cd backend && python main.py")
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
             }
         }
     }
@@ -222,5 +190,5 @@ private struct ElapsedTimeView: View {
         BackendSettingsView()
     }
     .environment(BackendManager())
-    .frame(width: 420, height: 520)
+    .frame(width: 420, height: 460)
 }

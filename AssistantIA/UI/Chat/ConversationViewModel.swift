@@ -132,20 +132,19 @@ class ConversationViewModel {
             messages[index].parts.append(.toolCall(id: id, name: name))
 
         case .toolCallResult:
-            guard let id = event.toolCallId, let content = event.content else { return }
-            // Mettre à jour la part toolCall correspondante si elle existe,
-            // sinon ajouter une part toolResult séparée
+            guard let id = event.toolCallId else { return }
+            // Marquer la part toolCall comme complétée et attacher l'aperçu
             if let partIdx = messages[index].parts.firstIndex(where: {
                 $0.type == .toolCall && $0.toolCallId == id
             }) {
-                messages[index].parts[partIdx] = MessagePart(
-                    type: .toolCall,
-                    content: content,
-                    toolCallId: id,
-                    toolName: messages[index].parts[partIdx].toolName
-                )
+                messages[index].parts[partIdx].isCompleted = true
+                messages[index].parts[partIdx].preview = event.preview
             } else {
-                messages[index].parts.append(.toolResult(id: id, content: content))
+                // Fallback : part toolCall absente (ne devrait pas arriver)
+                messages[index].parts.append(MessagePart(
+                    type: .toolResult, content: nil, toolCallId: id, toolName: nil,
+                    preview: event.preview, isCompleted: true
+                ))
             }
 
         case .start, .done, .error, .unknown:

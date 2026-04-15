@@ -36,7 +36,6 @@ from pydantic import BaseModel, Field
 from itertools import zip_longest
 
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
-from core.sse_transformer import parse_thinking_tags
 
 from models.conversation import (
     Conversation,
@@ -107,8 +106,7 @@ class MessageResponse(BaseModel):
             parts = []
             for p in msg.parts:
                 if isinstance(p, TextPart) and p.content:
-                    for part_type, content in parse_thinking_tags(p.content):
-                        parts.append(MessagePartResponse(type=part_type, content=content))
+                    parts.append(MessagePartResponse(type="text", content=p.content))
                 elif isinstance(p, ToolCallPart):
                     parts.append(MessagePartResponse(
                         type="toolCall",

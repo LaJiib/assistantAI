@@ -24,7 +24,9 @@ import threading
 from pathlib import Path
 from typing import Dict, List
 
-from models.conversation import Conversation, ConversationMetadata
+from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+from models.conversation import Conversation, ConversationMetadata, MessageMeta
 
 logger = logging.getLogger(__name__)
 
@@ -140,18 +142,31 @@ class JSONManager:
             if not path.exists():
                 raise FileNotFoundError(f"{conv_id}.json introuvable dans {self.data_folder}")
             try:
-                raw = path.read_text(encoding="utf-8")
-                return Conversation.model_validate_json(raw)
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return Conversation(
+                    id=data["id"],
+                    messages=ModelMessagesTypeAdapter.validate_python(data["messages"]),
+                    message_meta=[MessageMeta.model_validate(m) for m in data.get("message_meta", [])],
+                )
             except Exception as exc:
                 raise ValueError(f"{conv_id}.json invalide : {exc}") from exc
 
     def save_conversation(self, conversation: Conversation) -> None:
         with self._lock:
             path = self._conversation_path(conversation.id)
-            path.write_text(
-                conversation.model_dump_json(indent=2),
-                encoding="utf-8",
+            messages = json.loads(
+                ModelMessagesTypeAdapter.dump_json(conversation.messages, exclude_none=True)
             )
+            # Strip usage from responses (mlx-openai-server returns all zeros — inutile à stocker)
+            for msg in messages:
+                if msg.get("kind") == "response":
+                    msg.pop("usage", None)
+            data = {
+                "id": conversation.id,
+                "messages": messages,
+                "message_meta": [m.model_dump(mode="json") for m in conversation.message_meta],
+            }
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def delete_conversation(self, conv_id: str) -> None:
         """

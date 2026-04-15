@@ -78,6 +78,7 @@ struct StreamEvent {
     var content: String?
     var toolCallId: String?
     var toolName: String?
+    var preview: ToolPreview?   // aperçu structuré pour toolCallResult
 }
 
 // MARK: - Private API response types
@@ -129,7 +130,27 @@ private struct RawSSEEvent: Decodable {
     let content:    String?
     let toolCallId: String?
     let toolName:   String?
-    let error:      String?   // Pour la rétrocompatibilité éventuelle
+    let error:      String?
+    let preview:    ToolPreview?    // aperçu structuré (toolCallResult uniquement)
+
+    enum CodingKeys: String, CodingKey {
+        case type, content, toolCallId, toolName, error, preview
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type       = try c.decodeIfPresent(String.self, forKey: .type)
+        content    = try c.decodeIfPresent(String.self, forKey: .content)
+        toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
+        toolName   = try c.decodeIfPresent(String.self, forKey: .toolName)
+        error      = try c.decodeIfPresent(String.self, forKey: .error)
+        // Décodage tolérant : si le preview est malformé, on ignore sans planter l'event
+        do {
+            preview = try c.decodeIfPresent(ToolPreview.self, forKey: .preview)
+        } catch {
+            preview = nil
+        }
+    }
 }
 
 // MARK: - Request bodies
@@ -335,7 +356,8 @@ actor ConversationAPI {
                                 type: eventType,
                                 content: evt.content,
                                 toolCallId: evt.toolCallId,
-                                toolName: evt.toolName
+                                toolName: evt.toolName,
+                                preview: evt.preview
                             ))
                         }
                     }
@@ -428,11 +450,15 @@ actor ConversationAPI {
 
     private func toDomain(_ part: APIMessagePart) -> MessagePart {
         let partType = MessagePart.PartType(rawValue: part.type) ?? .text
+        // Les tool calls persistés en historique sont par définition terminés.
+        // isCompleted = nil (défaut) déclencherait le spinner au lieu du checkmark.
+        let isCompleted: Bool? = (partType == .toolCall) ? true : nil
         return MessagePart(
             type: partType,
             content: part.content,
             toolCallId: part.toolCallId,
-            toolName: part.toolName
+            toolName: part.toolName,
+            isCompleted: isCompleted
         )
     }
 

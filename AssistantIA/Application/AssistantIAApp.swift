@@ -2,8 +2,6 @@
 //  AssistantIAApp.swift
 //  AssistantIA
 //
-//  Created by JB SENET on 31/01/2026.
-//
 
 import SwiftUI
 
@@ -17,46 +15,27 @@ struct AssistantIAApp: App {
             RootView(conversationManager: conversationManager)
                 // Rend backendManager accessible à toutes les vues enfants
                 .environment(backendManager)
-                // Démarrage backend asynchrone : UI s'affiche immédiatement,
-                // backend charge en arrière-plan (~20s pour le modèle).
+                // Connexion au backend asynchrone : UI s'affiche immédiatement,
+                // le manager poll /health jusqu'à ce que le backend soit prêt.
                 // .task est annulé automatiquement si la fenêtre se ferme.
                 .task {
-                    await startBackend()
-                }
-                // Backstop : NSApplication.willTerminate garantit l'arrêt
-                // même si le .task n'est pas encore annulé au moment du quit.
-                .onReceive(
-                    NotificationCenter.default.publisher(
-                        for: NSApplication.willTerminateNotification
-                    )
-                ) { _ in
-                    backendManager.stop()
+                    await connectToBackend()
                 }
         }
     }
 
-    /// Lance le backend puis charge les conversations depuis l'API.
+    /// Se connecte au backend puis charge les conversations depuis l'API.
     /// Les erreurs sont absorbées — l'état est visible via backendManager.state
     /// et conversationManager.loadError.
     @MainActor
-    private func startBackend() async {
-        do {
-            try await backendManager.start()
-        } catch is CancellationError {
-            // App quittée pendant le démarrage : arrêter le process si encore actif
-            backendManager.stop()
-            return
-        } catch {
-            // Échec startup : backendManager.state est déjà .error avec le message
-            print("[App] ⚠️ Backend startup échoué : \(error.localizedDescription)")
-            return
-        }
+    private func connectToBackend() async {
+        await backendManager.connect()
 
-        // Backend prêt → charger les conversations depuis l'API
+        guard backendManager.state.isRunning else { return }
+
         do {
             try await conversationManager.loadConversations()
         } catch {
-            // Erreur exposée via conversationManager.loadError — pas de crash
             print("[App] ⚠️ Chargement conversations échoué : \(error.localizedDescription)")
         }
     }

@@ -19,13 +19,13 @@
 
 | Couche | Technologie | Notes |
 |--------|-------------|-------|
-| Inférence | `mlx-vlm >= 0.4.3` | `stream_generate()` + `apply_chat_template()` via processor |
-| Modèle | Gemma 4 26B A4B (Q8_0, ~28 Go) | MoE, 3.8B params actifs, 256K contexte |
-| Orchestration agent | `pydantic-ai >= 0.0.14` | IrisModel custom wrappant IrisEngine |
-| API | FastAPI + uvicorn | SSE streaming, préfixe `/api/conversations/` |
+| Serveur inférence | `mlx-openai-server` (port 8001) | API OpenAI-compatible localhost, parsers Gemma 4 natifs |
+| Modèle | Gemma 4 26B A4B (local, 4-bit) | `--model-type multimodal` — chargé via mlx-vlm |
+| Orchestration agent | `pydantic-ai` + `OpenAIModel` | Provider standard + sous-classe légère pour reasoning |
+| API BFF | FastAPI + uvicorn (port 8000) | SSE streaming vers Swift |
 | Persistance conversations | JSON + JSONManager | `DATA_FOLDER` env ou `backend/storage/data/` |
 | Persistance tools | ToolRegistry (JSON) | `TOOLS_FOLDER` env ou `backend/storage/tools/` |
-| Frontend | Swift / SwiftUI (macOS + iOS) | Consomme SSE, gère lifecycle backend via subprocess |
+| Frontend | Swift / SwiftUI (macOS + iOS) | Consomme SSE BFF port 8000, gère lifecycle backend |
 | Mémoire vectorielle | LanceDB + nomic-embed-text-v1.5 | **Étape 2 — non implémenté** |
 
 ---
@@ -34,35 +34,40 @@
 
 ```
 backend/
-├── main.py                     # Lifespan FastAPI, startup modèle, routes debug
+├── main.py                     # Lifespan : subprocess mlx-openai-server,
+│                               #   crée l'agent pydantic-ai, routes debug
 ├── requirements.txt
 ├── .claude/
 │   └── skills/
-│       ├── mlx-vlm-inference.md            # API mlx-vlm, stream_generate, apply_chat_template
-│       └── building-pydantic-ai-agents.md  # IrisModel custom, StreamedResponse, event types
+│       ├── mlx-gemma4-assistant/SKILL.md       # ← référence principale
+│       ├── mlx-vlm-inference/SKILL.md
+│       └── building-pydantic-ai-agents/SKILL.md
 ├── api/
-│   ├── conversations.py        # CRUD conversations
-│   └── messages.py             # /messages/stream (SSE BFF) ← point d'entrée principal
-│                               # ⚠️  POST /messages/ (non-stream) supprimé
+│   ├── conversations.py        # CRUD conversations (inchangé)
+│   └── messages.py             # /messages/stream SSE BFF
 ├── core/
-│   ├── agent.py                # IrisModel, IrisStreamedResponse, _messages_to_mlx,
-│   │                           #   _tool_defs_to_openai, create_iris_agent, IrisDeps
-│   ├── llm.py                  # IrisEngine : load, stream_messages, _generate_raw, _stream_raw
-│   ├── sse_transformer.py      # GemmaThinkingParser, transform_agent_event, parse_thinking_tags
+│   ├── agent.py                # create_iris_agent(), ReasoningAwareOpenAIModel,
+│   │                           #   IrisDeps, build_dynamic_system_prompt, IRIS_SYSTEM_PROMPT
+│   ├── sse_transformer.py      # transform_agent_event(), parse_thinking_tags()
 │   └── tools/
-│       ├── registry.py         # ToolRegistry thread-safe, persistance JSON
-│       └── schema.py           # ToolSchema, PermissionLevel
+│       ├── registry.py
+│       └── schema.py
 ├── tools/
-│   ├── __init__.py             # register_builtin_tools()
-│   └── builtin/                # web_search, fetch_webpage (outils système, immuables)
+│   ├── __init__.py
+│   └── builtin/                # web_search, fetch_webpage
 ├── models/
-│   └── conversation.py         # ConversationMetadata, MessageMeta
+│   └── conversation.py
 ├── storage/
-│   ├── json_manager.py         # Lecture/écriture conversations JSON
-│   └── tools/                  # Fallback storage registry
+│   ├── json_manager.py
+│   └── tools/
 └── tests/
-    └── test_messages_api.py    # ⚠️  OBSOLÈTE — à réécrire (voir section Tests)
+    └── test_messages_api.py    # ⚠️  À réécrire
 ```
+
+**Fichiers supprimés par la migration :**
+- `core/llm.py` — IrisEngine (mlx-vlm direct)
+- `core/agent.py` ancienne version — IrisModel custom, IrisStreamedResponse,
+  state machine, `_messages_to_mlx`, `_parse_gemma_tool_call`, `_strip_gemma_thinking`
 
 ---
 
@@ -74,40 +79,37 @@ backend/
 Swift client
     │  POST /api/conversations/{id}/messages/stream
     ▼
-api/messages.py : send_message_stream()
+FastAPI BFF (port 8000) — api/messages.py : send_message_stream()
     │  Charge historique JSON → ModelMessage[]
     │  Construit system prompt via build_dynamic_system_prompt(IrisDeps)
     │  iris_agent.run_stream_events(user_msg, message_history=..., deps=deps)
     ▼
-Pydantic AI agent loop
-    │  Appelle IrisModel.request_stream()
+Pydantic AI agent loop (ReasoningAwareOpenAIModel)
+    │  Sous-classe de OpenAIModel qui intercepte delta.reasoning_content
+    │  et l'envoie dans une asyncio.Queue par requête
+    │  POST http://127.0.0.1:8001/v1/chat/completions (stream=True)
     ▼
-IrisModel.request_stream()                    [core/agent.py]
-    │  _messages_to_mlx()     → list[dict] pour apply_chat_template
-    │  _tool_defs_to_openai() → format OpenAI injecté dans le template
-    │  yield IrisStreamedResponse(...)
+mlx-openai-server (port 8001)
+    │  --model-type multimodal      → Gemma 4 via mlx-vlm (texte + vision)
+    │  --reasoning-parser gemma4    → strip balises → delta.reasoning_content
+    │  --tool-call-parser gemma4    → parse tool calls → delta.tool_calls
+    │  --enable-auto-tool-choice
     ▼
-IrisStreamedResponse._get_event_iterator()   [core/agent.py]
-    │  Lance IrisEngine.stream_messages() dans un thread → asyncio.Queue
-    │  State machine sur chunks bruts :
-    │    SCAN      → cherche le prochain marqueur spécial
-    │    THINKING  → <|channel>thought…<channel|> : ignoré silencieusement
-    │    TOOL_CALL → <|tool_call>…<tool_call|> : bufférisé complet
-    │                → handle_tool_call_part() une fois fermé
-    │    TEXT      → handle_text_delta() chunk par chunk
+Gemma 4 26B A4B — Metal, Apple Silicon
     ▼
-Pydantic AI reçoit les events natifs
-    │  FunctionToolCallEvent  → exécute le tool via ToolRegistry
-    │  FunctionToolResultEvent → reconstruit contexte via _messages_to_mlx()
-    │  PartDeltaEvent(TextPartDelta) → transmis à transform_agent_event()
+SSE OpenAI-compatible :
+    │  delta.reasoning_content → intercepté par ReasoningAwareOpenAIModel
+    │                            → asyncio.Queue → reasoningDelta BFF
+    │  delta.content           → TextPartDelta pydantic-ai → textDelta BFF
+    │  delta.tool_calls        → FunctionToolCallEvent pydantic-ai
     ▼
-core/sse_transformer.py : transform_agent_event()
-    │  GemmaThinkingParser.feed() — filet de sécurité si balise non filtrée en amont
-    │  → SSE BFF events JSON
+api/messages.py consomme EN PARALLÈLE :
+    │  run_stream_events()          → textDelta, toolCallStart, toolCallResult
+    │  reasoning_queue              → reasoningDelta
     ▼
 Swift client reçoit :
     {"type": "start"}
-    {"type": "reasoningDelta", "content": "..."}
+    {"type": "reasoningDelta", "content": "..."}   ← arrive avant textDelta
     {"type": "textDelta",      "content": "..."}
     {"type": "toolCallStart",  "toolCallId": "...", "toolName": "..."}
     {"type": "toolCallResult", "toolCallId": "...", "content": "..."}
@@ -116,200 +118,167 @@ Swift client reçoit :
     data: [DONE]
 ```
 
-### Notes importantes
+### Propriétés du flux reasoning
 
-- **Tool calls non streamés** : accumulés en mémoire jusqu'à `<tool_call|>`, émis en un seul event. L'affichage reprend à la réponse finale.
-- **Stop sequence** `<|tool_response>` : native Gemma 4, arrête `stream_generate()` proprement après chaque tool call, permettant à Pydantic AI de reprendre la main.
-- **GemmaThinkingParser** dans `sse_transformer.py` : redondant dans le flux normal (la state machine a déjà strippé les thoughts), mais conservé comme filet de sécurité et pour `parse_thinking_tags()` sur les messages historiques.
+- `delta.reasoning_content` arrive **en premier** dans le flux SSE, avant `delta.content`
+- Reasoning et tool calls sont **mutuellement exclusifs** par tour : le modèle émet
+  l'un ou l'autre, jamais les deux simultanément
+- Pydantic-ai ignore `delta.reasoning_content` nativement — la sous-classe
+  `ReasoningAwareOpenAIModel` intercepte ces tokens avant que le parent les écarte
 
----
+### Vision multimodale
 
-## 🧠 Règles critiques Gemma 4
-
-Ces règles sont non négociables. Toute déviation produit des comportements erratiques.
-
-### 1. Thinking mode obligatoire avec tools
-
-`enable_thinking=True` est **requis** dès que des tools sont présents.
-Sans `<|think|>` en début de system prompt, Gemma 4 génère du JSON ReAct
-(`{"action": ..., "action_input": ...}`) au lieu du format natif `<|tool_call>`.
-
-Géré automatiquement par `apply_chat_template(..., enable_thinking=True)`.
-
-### 2. Arguments de tool call : dict, jamais string sérialisée
-
-```python
-# ❌ Incorrect — produit {{...}} dans le prompt reconstruit
-"arguments": json.dumps(args)
-
-# ✅ Correct — le template Jinja formate lui-même
-"arguments": args   # dict Python
-```
-
-Le template Jinja encadre les arguments de ses propres `{ }`.
-Une string JSON produit `{{"key": "value"}}` — corruption du contexte garantie.
-
-### 3. Tool responses dans le même message assistant
-
-```python
-# ✅ Format canonique Gemma 4
-{
-    "role": "assistant",
-    "tool_calls": [
-        {"function": {"name": "web_search", "arguments": {"query": "..."}}}
-    ],
-    "tool_responses": [
-        {"name": "web_search", "response": "...résultat..."}
-    ],
-    "content": ""   # vide jusqu'à la réponse finale
-}
-
-# ❌ Incorrect — produit <|turn>tool (rôle non documenté)
-{"role": "tool", "content": "...", "tool_call_id": "..."}   # message séparé
-```
-
-### 4. Gestion des thoughts en multi-turn
-
-- **Entre deux tours utilisateur** : thoughts strippés automatiquement par la macro `strip_thinking` du chat template.
-- **Au sein d'une séquence de tool calls** (même tour modèle) : thoughts **conservés** entre les itérations — ne pas stripper entre deux tool calls consécutifs.
-
-### 5. Paramètres de sampling
-
-```python
-temperature = 1.0    # valeur d'entraînement — ne pas baisser
-top_p       = 0.95
-top_k       = 64
-```
-
-`temperature=0.3` (valeur actuelle dans le code) dégrade les capacités de raisonnement.
-**À corriger dans `api/messages.py` et partout où `ModelSettings` est construit.**
+`--model-type multimodal` active le support image via mlx-vlm.
+Le serveur accepte des images au format OpenAI standard (`image_url` base64 ou URL).
+Pydantic-ai peut passer des images via `ImageUrl`. Non exposé dans l'API Swift pour l'instant — Étape future.
 
 ---
 
-## 🐛 Bugs actifs — priorité d'intervention
+## ⚙️ Configuration mlx-openai-server
 
-### 🔴 Bug 1 — arguments sérialisés en string
-**Fichiers** : `core/agent.py` (`_messages_to_mlx`), `core/llm.py` (`_build_assistant_message`)
-**Symptôme** : `{{query: "..."}}` dans le prompt reconstruit → contexte corrompu
-**Correction** : passer `args` directement (dict) sans `json.dumps()`.
-`ToolCallPart.args` peut être `ArgsDict` ou `str` selon la version Pydantic AI — parser si string.
+### Flags de démarrage
 
-### 🔴 Bug 2 — tool response dans un tour séparé
-**Fichier** : `core/agent.py` (`_messages_to_mlx`)
-**Symptôme** : `<|turn>tool` dans le prompt — rôle non documenté Gemma 4
-**Correction** : détecter quand un `ModelRequest` suivant un `ModelResponse` avec tool calls
-contient uniquement des `ToolReturnPart`, et fusionner dans `tool_responses` du message assistant.
+```bash
+mlx-openai-server launch \
+  --model-path $MODEL_PATH \
+  --model-type multimodal \
+  --reasoning-parser gemma4 \
+  --tool-call-parser gemma4 \
+  --enable-auto-tool-choice \
+  --served-model-name gemma4 \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --context-length 32768 \
+  --temperature 1.0 \
+  --queue-timeout 300
+```
 
-### 🔴 Bug 3 — enable_thinking False avec tools
-**Fichier** : `core/agent.py` (`request()`, `request_stream()`)
-**Symptôme** : format ReAct JSON au lieu de `<|tool_call>` natif
-**Correction** : activer `enable_thinking=True` automatiquement si `tools_openai` non vide.
+**Points critiques :**
+- `--model-type multimodal` : obligatoire (sinon chat template incorrect)
+- `--port 8001` : FastAPI occupe le 8000
+- `--context-length 32768` : évite Metal paging (~16 Go GPU à 4-bit)
+- `--temperature 1.0` : valeur d'entraînement Gemma 4, ne pas descendre sous 0.7
+- `--served-model-name gemma4` doit correspondre à `OpenAIModel("gemma4", …)`
 
-### 🟡 Dette — paramètres sampling incorrects
-**Fichier** : `api/messages.py`, `main.py`
-**Correction** : `temperature=1.0, top_p=0.95, top_k=64`
+### Subprocess dans le lifespan FastAPI
+
+Voir `.claude/skills/mlx-gemma4-assistant/SKILL.md` §2 pour le code exact.
+- Poll `/health` sur `127.0.0.1:8001` — timeout 180s
+- Ne **pas** importer `MLXVLMHandler` dans le process FastAPI → GPU semaphore leak
+- `proc.terminate()` + `proc.wait(timeout=10)` dans le `finally`
 
 ---
 
-## 🧪 État des tests
+## 🤖 ReasoningAwareOpenAIModel
 
-### Situation actuelle
+Sous-classe de `OpenAIModel` (pydantic-ai) qui intercepte `delta.reasoning_content`
+tout en laissant le tool loop et la gestion de contexte intacts.
 
-`tests/test_messages_api.py` : **17/20 en échec — obsolète, à réécrire après les bugs 1-3.**
+```python
+# Schéma conceptuel — implémentation dans core/agent.py
+class ReasoningAwareOpenAIModel(OpenAIModel):
+    """
+    Sous-classe minimale d'OpenAIModel qui intercepte delta.reasoning_content
+    et l'envoie dans une asyncio.Queue par requête, sans affecter le tool loop.
+    """
+    # La Queue est injectée par requête (thread-safe par conversation)
+    # Override du point d'extension approprié dans pydantic-ai
+    # (à déterminer en lisant le source pydantic-ai)
+```
 
-Causes des échecs :
-- **405** sur `POST /messages/` : endpoint non-stream supprimé, seul `/messages/stream` existe.
-- **503** sur les tests stream : mock `make_app()` n'injecte pas `iris_agent` dans `app.state`.
-- Schémas de réponse (`userMessage`, `assistantMessage`) ne correspondent plus au protocole SSE BFF.
+L'implémentation exacte dépend des internals de pydantic-ai — Claude Code doit
+lire le source pour identifier le bon point d'extension (`request_stream()` ou
+`_get_event_iterator()` de `OpenAIStreamedResponse`).
 
-3 tests passent encore : ceux qui testent les conversations ou le 503 engine.
+### Wiring dans create_iris_agent()
 
-### Ce que les nouveaux tests devront couvrir
+```python
+from openai import AsyncOpenAI
+from pydantic_ai import Agent
+from core.agent import ReasoningAwareOpenAIModel
 
-- `GET /messages/` : liste vide, system exclu
-- `POST /messages/stream` : SSE valide (`start` → `textDelta` → `done` → `[DONE]`)
-- `POST /messages/stream` : persistence après `[DONE]`, messageCount +2
-- `POST /messages/stream` conv inexistante → 404
-- `POST /messages/stream` content vide → 422
-- `POST /messages/stream` agent non initialisé → 503
-- Unitaire `_messages_to_mlx` : tool_calls + tool_responses fusionnés dans le même message
-- Unitaire `_messages_to_mlx` : arguments restent des dicts
+_local_client = AsyncOpenAI(
+    base_url="http://127.0.0.1:8001/v1",
+    api_key="not-needed",
+)
 
-**Le mock devra injecter `engine` ET `iris_agent` dans `app.state`.**
+local_model = ReasoningAwareOpenAIModel("gemma4", openai_client=_local_client)
+
+agent = Agent(
+    model=local_model,
+    system_prompt=IRIS_SYSTEM_PROMPT,
+)
+```
 
 ---
 
 ## 🔧 ToolRegistry
 
-- Outils `created_by="system"` : **immuables**, ni écrasement ni suppression.
+- Outils `created_by="system"` : **immuables**.
 - `PermissionLevel` : `READ_ONLY < WRITE_SAFE < WRITE_MODIFY < SYSTEM_EXEC < NETWORK < AUTONOMOUS`
-- Tout tool call loggé avec ses arguments pour audit humain.
-- **Note** : registry implémenté mais seuls `web_search` et `fetch_webpage` sont enregistrés.
+- Outils actifs : `web_search`, `fetch_webpage`.
+
+---
+
+## 🧪 État des tests
+
+`tests/test_messages_api.py` : **obsolète, à réécrire après la migration.**
+
+Les nouveaux tests devront mocker `ReasoningAwareOpenAIModel` et le subprocess,
+et couvrir : streaming SSE valide (textDelta + reasoningDelta), persistence après
+`[DONE]`, 404/422/503.
 
 ---
 
 ## 🗺 Roadmap — état réel
 
-### ✅ Étape 1 — Core inférence (TERMINÉ)
-- `core/llm.py` : IrisEngine, mlx-vlm, streaming
-- `core/agent.py` : IrisModel (Pydantic AI), IrisStreamedResponse, state machine
-- `core/sse_transformer.py` : GemmaThinkingParser, transform_agent_event
-- `api/messages.py` : endpoint SSE complet avec persistance
-- `tools/builtin/` : web_search, fetch_webpage
-- `core/tools/registry.py` : ToolRegistry thread-safe
+### ✅ Étape 0 — Stack mlx-vlm direct (ARCHIVÉ)
 
-### 🔧 Étape 1.5 — Corrections bugs tool calling (EN COURS)
-Bugs 1, 2, 3 dans `core/agent.py` et `core/llm.py`.
-Suivi : réécrire `tests/test_messages_api.py` après correction.
+### 🔧 Étape 1.5 — Migration mlx-openai-server (EN COURS)
+- Supprimer `core/llm.py`
+- Réécrire `core/agent.py` : `ReasoningAwareOpenAIModel`, `create_iris_agent`
+- Mettre à jour `main.py` : lifespan subprocess port 8001
+- Simplifier `core/sse_transformer.py`
+- Mettre à jour `requirements.txt`
+- Réécrire `tests/test_messages_api.py`
+
+### ⬜ Étape 1.7 — Vision
+Exposer upload d'images dans l'API Swift → `ImageUrl` vers pydantic-ai.
 
 ### ⬜ Étape 2 — Mémoire vectorielle
-- `storage/vector_store.py` : LanceDB, nomic-embed-text-v1.5 sur MPS
-- Tables : `table_user_core`, `table_pro_knowledge`, `tables_clients_{id}`
-- Context enrichment dans `IrisDeps` avant chaque tour
-- Worker de consolidation post-session
+LanceDB + nomic-embed-text-v1.5, context enrichment dans IrisDeps.
 
 ### ⬜ Étape 3 — Sandbox et skills dynamiques
-- `core/sandbox.py` : Wasmtime / WASI, workspace `~/Iris_Workspace/`
-- Outil `code_interpreter` (Excel, CSV)
-- Chargement dynamique de skills générés par l'IA
+Wasmtime / WASI, `code_interpreter`, chargement dynamique.
 
 ---
 
 ## 📝 Instructions pour Claude Code
 
 ### Avant toute modification
-1. Lire ce fichier (`AGENTS.md`) en entier.
-2. Lire les skills pertinents (tableau ci-dessous).
-3. Lire le fichier cible dans son intégralité.
-4. Vérifier l'état des tests : `cd backend && python -m pytest tests/ -v`
+1. Lire `AGENTS.md` en entier.
+2. Lire `.claude/skills/mlx-gemma4-assistant/SKILL.md` en entier.
+3. Lire `.claude/skills/building-pydantic-ai-agents/SKILL.md` en entier.
+4. Lire les fichiers cibles avant de les modifier.
 
 ### Skills de référence
 
-Disponibles dans `backend/.claude/skills/` :
-
 | Skill | Lire avant de modifier |
 |-------|------------------------|
-| `mlx-vlm-inference.md` | `core/llm.py`, tout ce qui touche `stream_generate`, `apply_chat_template`, `processor` |
-| `building-pydantic-ai-agents.md` | `core/agent.py`, `IrisModel`, `IrisStreamedResponse`, `_parts_manager`, event types Pydantic AI |
+| `mlx-gemma4-assistant/SKILL.md` | `main.py`, `core/agent.py`, tout ce qui touche au serveur |
+| `building-pydantic-ai-agents/SKILL.md` | `core/agent.py`, `core/sse_transformer.py`, tools |
 
 ### Règles de travail
-- **Une correction à la fois** — noter l'état des tests avant/après.
-- **Pas de refactoring opportuniste** — corriger uniquement ce qui est demandé.
-- **Pas de nouveaux fichiers** sans demande explicite.
-- **Conserver tous les commentaires** explicatifs existants.
-- Si une correction implique un choix d'architecture non trivial : **s'arrêter et demander**.
-
-### Commandes utiles
-```bash
-cd backend
-python -m pytest tests/ -v
-python -m pytest tests/test_messages_api.py -v -k "stream"
-uvicorn main:app --reload --port 8000
-```
+- Une étape à la fois — valider avant de passer à la suivante.
+- Pas de refactoring opportuniste.
+- Conserver tous les commentaires explicatifs.
+- Si un choix non trivial se présente : s'arrêter et demander.
 
 ### Variables d'environnement (voir `.env.example`)
 ```
-DATA_FOLDER    # dossier conversations JSON
-TOOLS_FOLDER   # dossier registry tools
-MODEL_PATH     # chemin modèle mlx-vlm local
+MODEL_PATH       # chemin absolu vers le dossier modèle Gemma 4 local
+DATA_FOLDER      # dossier conversations JSON
+TOOLS_FOLDER     # dossier registry tools
+MLX_SERVER_PORT  # port mlx-openai-server (défaut : 8001)
+API_PORT         # port FastAPI BFF (défaut : 8000)
 ```

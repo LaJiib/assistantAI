@@ -69,8 +69,8 @@ struct RootView: View {
                 .foregroundStyle(.secondary)
                 .labelStyle(.iconOnly)
                 .font(.title3)
-        case .starting:
-            Label("Backend en démarrage", systemImage: "circle.dotted")
+        case .connecting:
+            Label("Backend en connexion", systemImage: "circle.dotted")
                 .foregroundStyle(.orange)
                 .labelStyle(.iconOnly)
                 .symbolEffect(.pulse)

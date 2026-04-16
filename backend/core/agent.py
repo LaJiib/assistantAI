@@ -95,35 +95,21 @@ def build_dynamic_system_prompt(deps: IrisDeps) -> str:
     return "\n".join(sections)
 
 
-# ── ReasoningAwareOpenAIModel ─────────────────────────────────────────────────
 
-@dataclass(init=False)
-class ReasoningAwareOpenAIModel(OpenAIChatModel):
-    """
-    Sous-classe marker d'OpenAIChatModel pour mlx-openai-server + Gemma 4.
-
-    pydantic-ai 1.79.0 gère delta.reasoning_content nativement :
-      OpenAIStreamedResponse._map_thinking_delta() vérifie 'reasoning_content'
-      via getattr() — le SDK OpenAI préserve les champs extra (extra='allow').
-      → ThinkingPartDelta → transform_agent_event() → reasoningDelta SSE.
-
-    Aucun override nécessaire. Cette sous-classe existe comme marqueur explicite
-    et point d'extension futur si le comportement doit être personnalisé.
-    """
-    pass
 
 
 # ── Factory create_iris_agent ─────────────────────────────────────────────────
 
 def create_iris_agent(
-    model: ReasoningAwareOpenAIModel,
+    model: OpenAIChatModel,
     tools: list | None = None,
 ) -> Agent[IrisDeps, str]:
     """
     Crée et retourne un Agent Pydantic AI configuré pour Iris.
 
     L'agent est paramétré avec :
-      - ReasoningAwareOpenAIModel  : wrapper mlx-openai-server (A2)
+      - OpenAIChatModel pointant vers mlx-vlm-server (port 8001)
+
       - IrisDeps   : injection LanceDB ready (Étape 2)
       - output_type=str : réponse texte brute
       - tools : liste de callables Pydantic AI (web_search, fetch_webpage)

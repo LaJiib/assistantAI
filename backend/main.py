@@ -8,7 +8,7 @@ POST /agent/title         |  Génération de titre court
 Démarrage : python main.py
 
 Architecture A2 :
-  - mlx-openai-server (subprocess, port 8001) ← Gemma 4 via mlx-vlm
+  - mlx-vlm.server (subprocess, port 8001) ← Gemma 4 via mlx-vlm
   - FastAPI BFF (port 8000) ← Swift client
   - pydantic-ai Agent (ReasoningAwareOpenAIModel) ← orchestre tool loop
 """
@@ -18,10 +18,12 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import psutil
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -29,8 +31,9 @@ from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
-from core.agent import IrisDeps, ReasoningAwareOpenAIModel, create_iris_agent
+from core.agent import IrisDeps, create_iris_agent
 from core.tools import ToolRegistry
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from api.conversations import router as conversations_router
 from api.messages import router as messages_router
@@ -76,40 +79,52 @@ if GENERATION_TOP_K < 0:
     logger.warning("GENERATION_TOP_K invalide (%s), fallback à 0", GENERATION_TOP_K)
     GENERATION_TOP_K = 0
 
-# ── Commande de démarrage mlx-openai-server ───────────────────────────────────
+# ── Commande de démarrage mlx_vlm.server ───────────────────────────────────
 
 def _build_mlx_cmd(model_path: str, port: int) -> list[str]:
     return [
-        "mlx-openai-server", "launch",
-        "--model-path",        model_path,
-        "--model-type",        "multimodal",
-        "--reasoning-parser",  "gemma4",
-        "--tool-call-parser",  "gemma4",
-        "--enable-auto-tool-choice",
-        "--served-model-name", "gemma4",
-        "--host",              "127.0.0.1",
-        "--port",              str(port),
-        "--context-length",    "32768",
-        "--temperature",       "1.0",
-        "--queue-timeout",     "300",
-        "--no-log-file",
+        "mlx_vlm.server",
+        "--model",        model_path,
+        "--host",         "127.0.0.1",
+        "--port",         str(port),
     ]
 
 
+def _free_port(port: int) -> None:
+    """Tue tout process qui écoute sur le port donné (évite EADDRINUSE au redémarrage)."""
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            for conn in proc.net_connections(kind="tcp"):
+                if conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+                    logger.warning("Port %d occupé par pid %d (%s) — terminé", port, proc.pid, proc.name())
+                    proc.terminate()
+                    proc.wait(timeout=5)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            pass
+
+
+def _forward_stderr(proc: subprocess.Popen, prefix: str) -> None:
+    """Thread daemon : lit stderr du subprocess et le relaye dans notre logger."""
+    for raw in iter(proc.stderr.readline, b""):
+        line = raw.decode("utf-8", errors="replace").rstrip()
+        if line:
+            logger.info("[%s] %s", prefix, line)
+
+
 async def _wait_until_ready(url: str, timeout: float = 180.0) -> None:
-    """Poll /health jusqu'à ce que mlx-openai-server soit prêt (max timeout secondes)."""
-    deadline = asyncio.get_event_loop().time() + timeout
+    """Poll /health jusqu'à ce que mlx-vlm-server ait chargé le modèle (max timeout s)."""
+    deadline = asyncio.get_running_loop().time() + timeout
     async with httpx.AsyncClient() as client:
-        while asyncio.get_event_loop().time() < deadline:
+        while asyncio.get_running_loop().time() < deadline:
             try:
                 r = await client.get(url, timeout=2.0)
-                if r.status_code == 200:
-                    logger.info("✅ mlx-openai-server prêt sur %s", url)
+                if r.status_code == 200 and r.json().get("loaded_model"):
+                    logger.info("✅ mlx-vlm-server prêt sur %s", url)
                     return
-            except (httpx.ConnectError, httpx.ReadTimeout):
+            except (httpx.ConnectError, httpx.ReadTimeout, Exception):
                 pass
             await asyncio.sleep(1.5)
-    raise TimeoutError(f"mlx-openai-server non prêt après {timeout:.0f}s ({url})")
+    raise TimeoutError(f"mlx-vlm-server non prêt après {timeout:.0f}s ({url})")
 
 
 def _resolve_tools_folder() -> Path:
@@ -183,13 +198,15 @@ async def lifespan(app: FastAPI):
         logger.error("❌ MODEL_PATH non défini (vérifiez .env)")
         raise RuntimeError("MODEL_PATH non défini")
 
-    # ── Lancer mlx-openai-server en subprocess ────────────────────────────
+    # ── Lancer mlx-vlm-server en subprocess ────────────────────────────
+    _free_port(MLX_SERVER_PORT)
     mlx_cmd = _build_mlx_cmd(MODEL_PATH, MLX_SERVER_PORT)
-    logger.info("🚀 Lancement mlx-openai-server (port %d)…", MLX_SERVER_PORT)
+    logger.info("🚀 Lancement mlx-vlm-server (port %d)…", MLX_SERVER_PORT)
     logger.info("   %s", " ".join(mlx_cmd))
 
-    proc = subprocess.Popen(mlx_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(mlx_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     app.state.mlx_proc = proc
+    threading.Thread(target=_forward_stderr, args=(proc, "mlx-vlm"), daemon=True).start()
 
     # ── Attendre que le serveur soit prêt (bloquant, max 180s) ───────────
     try:
@@ -206,7 +223,7 @@ async def lifespan(app: FastAPI):
     app.state.local_client = local_client
 
     provider = OpenAIProvider(openai_client=local_client)
-    model    = ReasoningAwareOpenAIModel("gemma4", provider=provider)
+    model    = OpenAIChatModel(MODEL_PATH, provider=provider)
 
     app.state.iris_agent = create_iris_agent(
         model,
@@ -226,7 +243,7 @@ async def lifespan(app: FastAPI):
         # ── Shutdown ──────────────────────────────────────────────────────
         mlx_proc: subprocess.Popen | None = getattr(app.state, "mlx_proc", None)
         if mlx_proc is not None:
-            logger.info("⏹  Arrêt mlx-openai-server (pid %d)…", mlx_proc.pid)
+            logger.info("⏹  Arrêt mlx-vlm-server (pid %d)…", mlx_proc.pid)
             mlx_proc.terminate()
             try:
                 mlx_proc.wait(timeout=10)
@@ -347,7 +364,7 @@ async def agent_title(request: TitleRequest) -> TitleResponse:
 
     try:
         resp = await local_client.chat.completions.create(
-            model="gemma4",
+            model=MODEL_PATH,
             messages=[
                 {"role": "system", "content": _TITLE_SYSTEM},
                 {"role": "user",   "content": request.message},

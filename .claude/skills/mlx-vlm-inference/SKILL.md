@@ -173,87 +173,12 @@ The `pydantic-ai-mlx` community package (pip) only supports `mlx-lm` (text-only)
 ```
 pydantic-ai  (tools, structured output, agent loop)
      │  OpenAI-compatible HTTP  (localhost only, zero exfil)
-mlx-serve    (thin server wrapping mlx-vlm)
+mlx-vlm-serve    (thin server wrapping mlx-vlm)
      │  mlx-vlm Python API
 Mistral3 / Gemma4  (Metal, Apple unified memory)
 ```
 
-### Step 1 — Start the local server
 
-```bash
-pip install mlx-serve[all]
-
-# Starts an OpenAI-compatible server at localhost:8000
-mlx-serve start --model mlx-community/mistral-small-3.1-24b-instruct-4bit --model-type vlm
-```
-
-`--model-type vlm` is required for vision support; omit for text-only.
-
-### Step 2 — Point pydantic-ai at it
-
-```python
-from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
-import httpx
-
-# Zero data leaves the machine: base_url points to localhost
-local_model = OpenAIChatModel(
-    model_name="mistral-small-3.1-24b-instruct-4bit",  # must match --model arg
-    base_url="http://localhost:8000/v1",
-    api_key="not-used",                                  # required by client, ignored by server
-    http_client=httpx.AsyncClient(timeout=120.0),        # increase for slow first-token
-)
-
-agent = Agent(local_model, system_prompt="Tu es un assistant local souverain.")
-```
-
-### Step 3 — Use exactly like any pydantic-ai agent
-
-```python
-from pydantic_ai import Agent, RunContext, ImageUrl
-from pydantic import BaseModel
-
-class AnalysisResult(BaseModel):
-    description: str
-    objects_detected: list[str]
-
-agent = Agent(local_model, output_type=AnalysisResult)
-
-# Vision call — works because mlx-serve exposes multimodal endpoint
-result = await agent.run(
-    [
-        ImageUrl(url="file:///path/to/local/image.jpg"),
-        "Describe this image and list all objects.",
-    ]
-)
-print(result.output.description)
-```
-
-### Why this is better than wrapping mlx-vlm directly
-
-| Approach | Tool calls | Structured output | Vision | Complexity |
-|---|---|---|---|---|
-| mlx-serve + OpenAIChatModel | ✅ full | ✅ full | ✅ | Low |
-| Custom pydantic-ai Model subclass | manual impl | manual impl | manual | Very high |
-| mlx-vlm as a tool (old pattern) | n/a — VLM is a tool, not the agent | ❌ | ✅ | Medium |
-
-The OpenAI-compatible server layer is the correct abstraction: pydantic-ai gets a real
-model interface, mlx-vlm handles inference natively on Apple Silicon.
-
-### Server management tips
-
-```bash
-mlx-serve status          # check if running
-mlx-serve stop            # shut down
-mlx-serve logs            # tail logs
-
-# For Gemma4 (needs --model-type vlm):
-mlx-serve start --model mlx-community/gemma-4-12b-it-4bit --model-type vlm --port 8001
-```
-
-Multiple models can run on different ports — useful for routing light tasks to smaller models.
-
----
 
 ## 8. Common Errors & Fixes
 

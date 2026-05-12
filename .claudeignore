@@ -1,0 +1,2 @@
+.env          # Fichiers contenant tes clés API
+*.db          # Tes bases de données locales

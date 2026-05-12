@@ -54,3 +54,8 @@ Rien d'autre n'est en scope pour l'instant.
 claude mcp add --transport http docs-langchain --scope user \
   https://docs.langchain.com/mcp
 ```
+### Accès oMLX
+
+Le submodule omlx/ à la racine du repo contient le code source
+d'omlx : le lire pour comprendre l'API Anthropic exposée (endpoints,
+format des requêtes, authentification, tool calling).

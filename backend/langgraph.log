@@ -1,0 +1,30 @@
+Traceback (most recent call last):
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/bin/langgraph", line 6, in <module>
+    sys.exit(cli())
+             ^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/click/core.py", line 1485, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/click/core.py", line 1406, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/click/core.py", line 1873, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/click/core.py", line 1269, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/click/core.py", line 824, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/langgraph_cli/analytics.py", line 103, in decorator
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/langgraph_cli/cli.py", line 795, in dev
+    run_server(
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/langgraph_api/cli.py", line 204, in run_server
+    port = _resolve_port(host, port)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mr/AssistantIA/AssistantIA/backend/.venv/lib/python3.12/site-packages/langgraph_api/cli.py", line 156, in _resolve_port
+    raise OSError(
+OSError: Port 2024 is already in use. Please specify a different port or omit the port argument to auto-discover an available one.

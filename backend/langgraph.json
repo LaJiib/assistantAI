@@ -1,0 +1,19 @@
+{
+  "dockerfile_lines": [],
+  "graphs": {
+    "Iris": "./Iris/agent.py:graph",
+    "deep_research": "./deep_research/graph.py:deep_researcher"
+  },
+    "watch": {
+    "ignore": [
+      "__pycache__",
+      "*.pyc",
+      ".venv",
+      "*.log",
+      ".langgraph_cache"
+    ]
+  },
+  "env": "./.env",
+  "python_version": "3.12",
+  "dependencies": ["."]
+}

@@ -1,1 +1,3 @@
-backend/.env
+backend/.env/
+backend/.langgraph_api/
+backend/.__pycache__/

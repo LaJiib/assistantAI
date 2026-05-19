@@ -9,7 +9,7 @@ load_dotenv()
 from deepagents import AsyncSubAgent, AsyncSubAgentMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware, AgentMiddleware
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from utils.tools import web_search, fetch_webpage
 from langchain.agents.middleware import dynamic_prompt
 from langchain_core.messages import AIMessage
@@ -27,6 +27,16 @@ async_subagents = [
         graph_id="deep_research",
         # Pas d'url → ASGI transport, co-déployé
     ),
+    AsyncSubAgent(
+        name="coding",
+        description=(
+            "Expert software engineer. Can read any file on the system, "
+            "write and edit files inside a sandbox, and execute shell commands "
+            "(with human approval). Use for coding tasks, debugging, refactoring, "
+            "code generation, or modifying the Iris system itself."
+        ),
+        graph_id="coding",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -37,15 +47,13 @@ async_subagents = [
 # le tool au lieu de répondre. Avec thinking activé, ce bloc n'est pas injecté
 # et le modèle raisonne librement sur le résultat avant de formuler sa réponse.
 
-additional_kwargs = {"chat_template_kwargs": {"enable_thinking": True}, "thinking_tokens": 16384, "max_tokens": 32768}
-
-model = ChatOpenAI(
+model = ChatAnthropic(
     model=os.environ["OMLX_MODEL"],
-    base_url=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
-    api_key=os.environ.get("OPENAI_API_KEY", "local"),
-    model_kwargs= {
-        "extra_body":additional_kwargs
-    },
+    thinking={"type": "enabled", "budget_tokens": 8192},
+    max_tokens=8192,
+    temperature=0.6,
+    top_p=0.95,
+    top_k=20,
 )
 
 class GemmaContentCleaner(AgentMiddleware):
@@ -112,5 +120,5 @@ graph = create_agent(model,
                     middleware=[TodoListMiddleware(),
                                 AsyncSubAgentMiddleware(async_subagents=async_subagents),
                                 core_dynamic_prompt,
-                                GemmaContentCleaner(),
+                                ##GemmaContentCleaner(),
                                 ],)

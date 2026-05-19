@@ -1,6 +1,5 @@
 from langchain.tools import tool, ToolRuntime
 from langgraph.types import Command
-from playwright.async_api import async_playwright
 import logging
 import asyncio
 import os
@@ -36,54 +35,12 @@ def _cfg_int(key: str, default: int) -> int:
         return default
 
 
-# ---------------------------------------------------------------------------
-# Playwright — singleton connecté à Lightpanda via CDP
-# ---------------------------------------------------------------------------
 
-_playwright = None
-_browser = None
-_browser_lock = asyncio.Lock()  # initialisé au niveau module, pas lazy
 
 LIGHTPANDA_URL = os.getenv("LIGHTPANDA_URL", "http://127.0.0.1:9222")
 
 
-async def _get_browser():
-    global _playwright, _browser
 
-    async with _browser_lock:
-        # Vérifie si la connexion existante est toujours vivante
-        if _browser is not None:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(_browser.contexts()),
-                    timeout=2.0
-                )
-            except Exception:
-                logger.warning("[fetch] Connexion Lightpanda morte, reconnexion...")
-                _browser = None
-                try:
-                    await _playwright.stop()
-                except Exception:
-                    pass
-                _playwright = None
-
-        if _browser is None:
-            logger.info("[fetch] Connexion à Lightpanda sur %s...", LIGHTPANDA_URL)
-            try:
-                _playwright = await async_playwright().start()
-                _browser = await asyncio.wait_for(
-                    _playwright.chromium.connect_over_cdp(LIGHTPANDA_URL),
-                    timeout=10.0,
-                )
-                logger.info("[fetch] Lightpanda connecté")
-            except asyncio.TimeoutError:
-                _browser = None
-                raise RuntimeError(f"Timeout connexion Lightpanda sur {LIGHTPANDA_URL}")
-            except Exception as exc:
-                _browser = None
-                raise RuntimeError(f"Erreur connexion Lightpanda : {exc}")
-
-    return _browser
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +146,8 @@ async def fetch_webpage(
     url: str,
     runtime: ToolRuntime,
 ) -> dict:
-    """Fetch and extract the clean text content of a web page. Handles JavaScript-heavy pages.
-    Use when you need detailed content from a URL found in search results.
-    Always prefer this over relying on search snippets alone.
+    """Fetch and extract the clean text content of a web page.
+    Handles both static and JavaScript-heavy pages.
 
     Args:
         url: Full URL to fetch (http or https only).
@@ -204,52 +160,65 @@ async def fetch_webpage(
 
     logger.info("[fetch] → %s", url)
 
+    # ── Niveau 1 : httpx + trafilatura (rapide, sans browser) ──────────
     try:
-        browser = await _get_browser()
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)"}
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
 
-        context = await asyncio.wait_for(
-            browser.new_context(),
-            timeout=5.0,
+        from trafilatura import extract
+        text = extract(
+            response.text,
+            include_links=False,
+            include_comments=False,
+            no_fallback=False,
         )
-        try:
-            page = await context.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=20_000)
-            await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
-            text = await page.evaluate("""() => {
-                ['nav','footer','header','aside','form','script','style','noscript']
-                    .forEach(tag => document.querySelectorAll(tag)
-                    .forEach(el => el.remove()));
-                const main = document.querySelector('main, article, [role="main"]');
-                return (main || document.body).textContent
-                    .replace(/\\s+/g, ' ')
-                    .trim();
-            }""")
-        finally:
-            await context.close()
+        if text and len(text.split()) > 100:
+            return _build_result(url, text, max_words, method="http")
 
-    except asyncio.TimeoutError:
-        logger.error("[fetch] Timeout sur %s", url)
-        return {"error": f"Timeout lors du fetch de {url}"}
+    except Exception as e:
+        logger.debug("[fetch] Niveau 1 échoué sur %s : %s", url, e)
+
+    # ── Niveau 2 : Playwright + Chromium (JS-heavy) ────────────────────
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            html = await page.content()   # HTML brut — pas de page.evaluate()
+            await browser.close()
+
+        from trafilatura import extract
+        text = extract(html, include_links=False, no_fallback=False)
+        if text:
+            return _build_result(url, text, max_words, method="playwright")
+
     except Exception as exc:
         logger.error("[fetch] Erreur sur %s : %s", url, exc)
         return {"error": f"Erreur de crawl : {exc}"}
 
-    if not text or not text.strip():
-        logger.warning("[fetch] Contenu vide sur %s", url)
-        return {"error": "Impossible d'extraire du texte lisible depuis cette page."}
+    return {"error": "Impossible d'extraire du texte lisible depuis cette page."}
 
-    text, truncated = _truncate_to_words(text, max_words)
-    word_count = len(text.split())
 
-    logger.info("[fetch] ✓ %s — %d mots%s", url, word_count, " (tronqué)" if truncated else "")
-
+def _build_result(url: str, text: str, max_words: int, method: str) -> dict:
+    words = text.split()
+    truncated = len(words) > max_words
+    if truncated:
+        text = " ".join(words[:max_words])
+    word_count = min(len(words), max_words)
+    logger.info("[fetch] ✓ %s — %d mots (%s)%s", url, word_count, method,
+                " (tronqué)" if truncated else "")
     return {
         "url":        url,
         "content":    _wrap_external_content(url, text),
         "word_count": word_count,
         "truncated":  truncated,
     }
-
 
 @tool
 def report_tool_issue(tool_name: str, issue: str) -> Command:

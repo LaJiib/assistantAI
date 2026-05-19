@@ -2,7 +2,8 @@
   "dockerfile_lines": [],
   "graphs": {
     "Iris": "./Iris/agent.py:graph",
-    "deep_research": "./deep_research/graph.py:deep_researcher"
+    "deep_research": "./deep_research/graph.py:deep_researcher",
+    "coding": "./coding/graph.py:make_graph"
   },
     "watch": {
     "ignore": [
@@ -10,10 +11,12 @@
       "*.pyc",
       ".venv",
       "*.log",
-      ".langgraph_cache"
+      ".langgraph_cache",
+      ".langgraph_api"
     ]
   },
   "env": "./.env",
   "python_version": "3.12",
-  "dependencies": ["."]
+  "dependencies": ["."],
+  "n_jobs_per_worker": 5
 }

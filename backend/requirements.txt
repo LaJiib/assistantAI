@@ -5,6 +5,8 @@ langchain-anthropic
 langchain-openai
 python-dotenv
 deepagents
+trafilatura
+playwright
 langgraph-cli[inmem]
 psutil>=5.9.0
 pytz>=2024.1

@@ -1,4 +1,7 @@
 backend/.env
 backend/.langgraph_api/
 backend/.__pycache__/
+backend/deep_research/__pycache__/
+backend/utils/__pycache__/
+omlx/
 

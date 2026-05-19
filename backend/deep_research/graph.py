@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 import os
 from typing import Annotated
 
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.tools import tool, InjectedToolCallId, ToolRuntime
@@ -23,23 +23,27 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 _base = dict(
     model=os.environ["OMLX_MODEL"],
-    base_url=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
-    api_key=os.environ.get("OPENAI_API_KEY", "local"),
+    base_url=os.environ.get("ANTHROPIC_BASE_URL", "http://127.0.0.1:8000"),
+    api_key=os.environ.get("ANTHROPIC_API_KEY", "local"),
 )
 additional_kwargs_researcher = {"chat_template_kwargs": {"enable_thinking": True}, "thinking_tokens": 8192, "max_tokens": 16384}
-researcher_model = ChatOpenAI(
+researcher_model = ChatAnthropic(
     **_base,
-    model_kwargs= {
-        "extra_body": additional_kwargs_researcher,
-    },
+    thinking={"type": "enabled", "budget_tokens": 8192},
+    max_tokens=16384,
+    temperature=0.6,
+    top_p=0.95,
+    top_k=20,
 )
 
 additional_kwargs_supervisor = {"chat_template_kwargs": {"enable_thinking": True}, "thinking_tokens": 16384, "max_tokens": 32768}
-supervisor_model = ChatOpenAI(
+supervisor_model = ChatAnthropic(
     **_base,
-    model_kwargs= {
-        "extra_body": additional_kwargs_supervisor,
-    },
+    thinking={"type": "enabled", "budget_tokens": 16384},
+    max_tokens=32768,
+    temperature=0.6,
+    top_p=0.95,
+    top_k=20,
 )
 
 # ---------------------------------------------------------------------------
